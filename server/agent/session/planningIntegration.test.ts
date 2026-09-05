@@ -165,9 +165,9 @@ describe("adaptive planning composition", () => {
   }
 
   it("uses the configured adaptive router once and forwards its selected model to the existing provider boundary", async () => {
-    const registry = new (await import("../intelligence/modelRegistry")).ModelRegistry();
+    const registry = new (await import("../_archive/intelligence/modelRegistry")).ModelRegistry();
     registry.register(profile("adaptive-selected"));
-    const baseRouter = new (await import("../intelligence/adaptiveModelRouter")).AdaptiveModelRouter(registry);
+    const baseRouter = new (await import("../_archive/intelligence/adaptiveModelRouter")).AdaptiveModelRouter(registry);
     let routeCalls = 0;
     const router = { route(input: Parameters<typeof baseRouter.route>[0]) { routeCalls += 1; return baseRouter.route(input); } };
     let providerModelId: string | null | undefined;
@@ -180,7 +180,7 @@ describe("adaptive planning composition", () => {
   });
 
   it("keeps explicit custom strategy authoritative and does not call the adaptive router", async () => {
-    const registry = new (await import("../intelligence/modelRegistry")).ModelRegistry();
+    const registry = new (await import("../_archive/intelligence/modelRegistry")).ModelRegistry();
     registry.register(profile("should-not-route"));
     let routeCalls = 0;
     const router = { route() { routeCalls += 1; throw new Error("router should not be called"); } };
