@@ -4,7 +4,7 @@ import {
   selectToolAction,
   summarizeTask,
   verifyTaskResult,
-} from "../modelGateway";
+} from "../../modelGateway";
 import type { AdaptiveModelRouter } from "./adaptiveModelRouter";
 import type { ComplexityTier, IntelligenceDomain, RiskLevel, RoutingDecision, RoutingRequest } from "./routingTypes";
 
