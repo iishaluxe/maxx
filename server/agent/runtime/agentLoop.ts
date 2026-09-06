@@ -147,6 +147,28 @@ export class AgentLoop {
         return { status: "blocked", cycles, reason: execution.observation.output };
       }
 
+      if (execution.observation.outcome === "cancelled") {
+        // The executor already recorded failStep for a cancelled outcome but
+        // left the runtime running; a cancelled action was never completed,
+        // so it should never be run through verification.
+        this.runtime.cancel(execution.observation.output || "Cancelled during execution.");
+        await this.runtime.persistLatestEvent();
+        await this.runtime.persistCheckpoint();
+        return { status: "cancelled", cycles };
+      }
+
+      if (execution.observation.outcome === "failed") {
+        // The executor has already called beginRecovery() for this outcome,
+        // which moves the runtime to "recovering" and consumes one recovery
+        // attempt. "recovering" -> "verifying" is not a legal transition, so
+        // this branch must resolve recovery directly rather than falling
+        // through to beginVerification() below, which would throw.
+        const recovered = await this.attemptRecovery(execution.observation.output, cycles);
+        if (recovered.terminal) return recovered.result;
+        previousObservation = undefined;
+        continue;
+      }
+
       this.runtime.beginVerification();
       this.runtime.setPhase("verify");
 
@@ -189,27 +211,8 @@ export class AgentLoop {
       this.runtime.beginRecovery(reason);
       await this.runtime.persistLatestEvent();
 
-      if (!this.options.recovery) {
-        this.runtime.block(`No recovery strategy configured: ${reason}`);
-        await this.runtime.persistLatestEvent();
-        await this.runtime.persistCheckpoint();
-        return { status: "blocked", cycles, reason };
-      }
-
-      const recoveryPlan = await this.options.recovery({
-        reason,
-        snapshot: this.runtime.snapshot(),
-      });
-
-      if (!recoveryPlan) {
-        this.runtime.block(`Recovery strategy returned no action: ${reason}`);
-        await this.runtime.persistLatestEvent();
-        await this.runtime.persistCheckpoint();
-        return { status: "blocked", cycles, reason };
-      }
-
-      this.runtime.completeRecovery("planner-recovery");
-      await this.runtime.persistLatestEvent();
+      const recovered = await this.attemptRecovery(reason, cycles, { alreadyBegun: true });
+      if (recovered.terminal) return recovered.result;
       previousObservation = undefined;
     }
 
@@ -221,5 +224,52 @@ export class AgentLoop {
       cycles,
       reason: "Agent loop cycle budget exhausted.",
     };
+  }
+
+  /**
+   * Shared by both recovery entry points: a capability execution that
+   * itself failed (runtime already in "recovering", attempt already
+   * consumed by the executor), and a completed execution whose evidence
+   * failed verification (runtime moved to "recovering" just above, by
+   * this same call site, via beginRecovery()). Consolidated so the two
+   * paths cannot drift out of sync with each other.
+   */
+  private async attemptRecovery(
+    reason: string,
+    cycles: number,
+    options: { alreadyBegun?: boolean } = {},
+  ): Promise<{ terminal: true; result: AgentLoopResult } | { terminal: false }> {
+    if (!options.alreadyBegun) {
+      const state = this.runtime.getState();
+      if (state.recoveryAttempts >= state.maxRecoveryAttempts) {
+        this.runtime.fail(`Recovery budget exhausted: ${reason}`);
+        await this.runtime.persistLatestEvent();
+        await this.runtime.persistCheckpoint();
+        return { terminal: true, result: { status: "failed", cycles, reason } };
+      }
+    }
+
+    if (!this.options.recovery) {
+      this.runtime.block(`No recovery strategy configured: ${reason}`);
+      await this.runtime.persistLatestEvent();
+      await this.runtime.persistCheckpoint();
+      return { terminal: true, result: { status: "blocked", cycles, reason } };
+    }
+
+    const recoveryPlan = await this.options.recovery({
+      reason,
+      snapshot: this.runtime.snapshot(),
+    });
+
+    if (!recoveryPlan) {
+      this.runtime.block(`Recovery strategy returned no action: ${reason}`);
+      await this.runtime.persistLatestEvent();
+      await this.runtime.persistCheckpoint();
+      return { terminal: true, result: { status: "blocked", cycles, reason } };
+    }
+
+    this.runtime.completeRecovery("planner-recovery");
+    await this.runtime.persistLatestEvent();
+    return { terminal: false };
   }
 }
