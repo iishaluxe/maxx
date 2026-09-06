@@ -25,7 +25,7 @@ import { E2BCloudSandboxAdapter } from "../agent/e2bAdapter";
 import { generatePlan, getAvailableModels } from "../agent/modelGateway";
 import { assessBudget, canTransition, evaluateCapabilityPolicy, type TaskStatus } from "../agent/policy";
 import { capabilityRegistry, executionTargets } from "../agent/registry";
-import { runAgentTask } from "../agent/taskRunner";
+import { runDurableTask } from "../agent/runtime/durableTaskRunner";
 import { notifyOwner } from "../_core/notification";
 import { protectedProcedure, router } from "../_core/trpc";
 import { storagePut } from "../storage";
@@ -139,7 +139,7 @@ export const agentRouter = router({
     if (!["queued", "executing", "recovering"].includes(task.status)) {
       throw new TRPCError({ code: "CONFLICT", message: `Task cannot be run from status "${task.status}".` });
     }
-    return runAgentTask(task.id, ctx.user.id, capabilityBroker);
+    return runDurableTask(task.id, ctx.user.id, capabilityBroker);
   }),
 
   requestApproval: protectedProcedure.input(z.object({
