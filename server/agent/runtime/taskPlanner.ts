@@ -1,6 +1,6 @@
 import type { CapabilityObservation, CapabilityRequest } from "../execution";
 import { getAgentTaskDetail, updatePlanStepStatus } from "../../db";
-import { decideRecovery, interpretObservation, selectCapabilityArguments } from "../modelGateway";
+import { taskIntelligenceGateway } from "../intelligenceRouting";
 import type { AgentPlanner, AgentRecovery } from "./agentLoop";
 
 export type TaskPlannerContext = {
@@ -62,7 +62,7 @@ export function createTaskPlanner(context: TaskPlannerContext): {
     if (previousObservation.outcome === "completed") {
       await updatePlanStepStatus({ id, taskId: context.taskId, status: "complete" });
       try {
-        const interpretation = await interpretObservation({
+        const interpretation = await taskIntelligenceGateway.interpretObservation({
           modelId: context.modelId,
           taskGoal: context.goal,
           observation: previousObservation.output,
@@ -96,7 +96,7 @@ export function createTaskPlanner(context: TaskPlannerContext): {
 
     let args;
     try {
-      args = await selectCapabilityArguments({
+      args = await taskIntelligenceGateway.selectCapabilityArguments({
         modelId: context.modelId,
         taskGoal: context.goal,
         step: next,
@@ -135,7 +135,7 @@ export function createTaskPlanner(context: TaskPlannerContext): {
 
     let decision;
     try {
-      decision = await decideRecovery({
+      decision = await taskIntelligenceGateway.decideRecovery({
         modelId: context.modelId,
         goal: context.goal,
         failedAction: step.title,
@@ -163,7 +163,7 @@ export function createTaskPlanner(context: TaskPlannerContext): {
 
     let args;
     try {
-      args = await selectCapabilityArguments({
+      args = await taskIntelligenceGateway.selectCapabilityArguments({
         modelId: context.modelId,
         taskGoal: context.goal,
         step,
