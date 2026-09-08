@@ -62,11 +62,13 @@ vi.mock("../ownerAlerts", () => ({
 }));
 
 vi.mock("../modelGateway", () => ({
+  selectToolAction: vi.fn(async () => ({ value: { argumentSummary: "n/a", requiresApproval: false }, usedTokens: 1 })),
   selectCapabilityArguments: vi.fn(async () => ({ value: { path: "/" }, modelId: "test-model", usedTokens: 10 })),
   interpretObservation: vi.fn(async () => ({ value: { summary: "Listed the workspace root." }, usedTokens: 5 })),
   decideRecovery: vi.fn(async () => ({ value: { revisedApproach: "retry", nextIntent: "retry", reason: "transient" }, usedTokens: 4 })),
   verifyTaskResult: vi.fn(async () => ({ value: { passed: true, evidenceSummary: "ok", gaps: [] }, usedTokens: 8 })),
   summarizeTask: vi.fn(async () => ({ value: { summary: "Task completed and verified." }, usedTokens: 6 })),
+  generatePlan: vi.fn(async () => ({ plan: { steps: [] }, modelId: "test-model", usedTokens: 1 })),
 }));
 
 import { runDurableTask } from "./durableTaskRunner";

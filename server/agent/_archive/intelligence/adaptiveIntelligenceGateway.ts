@@ -1,6 +1,8 @@
 import {
   decideRecovery,
+  generatePlan,
   interpretObservation,
+  selectCapabilityArguments,
   selectToolAction,
   summarizeTask,
   verifyTaskResult,
@@ -17,20 +19,24 @@ export type AdaptiveIntelligencePolicy = {
 
 export type AdaptiveIntelligenceGatewayPort = {
   selectToolAction: typeof selectToolAction;
+  selectCapabilityArguments: typeof selectCapabilityArguments;
   interpretObservation: typeof interpretObservation;
   verifyTaskResult: typeof verifyTaskResult;
   decideRecovery: typeof decideRecovery;
   summarizeTask: typeof summarizeTask;
+  generatePlan: typeof generatePlan;
 };
 
 export type AdaptiveIntelligenceGatewayOptions = {
   router: AdaptiveModelRouter;
   policies: {
     toolUse: AdaptiveIntelligencePolicy;
+    capabilityArguments: AdaptiveIntelligencePolicy;
     observation: AdaptiveIntelligencePolicy;
     verification: AdaptiveIntelligencePolicy;
     recovery: AdaptiveIntelligencePolicy;
     summary: AdaptiveIntelligencePolicy;
+    plan: AdaptiveIntelligencePolicy;
   };
   gateway?: AdaptiveIntelligenceGatewayPort;
 };
@@ -66,10 +72,12 @@ export class AdaptiveIntelligenceGateway {
   constructor(private readonly options: AdaptiveIntelligenceGatewayOptions) {
     this.gateway = options.gateway ?? {
       selectToolAction,
+      selectCapabilityArguments,
       interpretObservation,
       verifyTaskResult,
       decideRecovery,
       summarizeTask,
+      generatePlan,
     };
   }
 
@@ -81,6 +89,18 @@ export class AdaptiveIntelligenceGateway {
       estimatedOutputTokens: 220,
     });
     return this.gateway.selectToolAction({ ...input, modelId: routing.modelId });
+  }
+
+  async selectCapabilityArguments(
+    input: Parameters<typeof selectCapabilityArguments>[0],
+  ): Promise<Awaited<ReturnType<typeof selectCapabilityArguments>>> {
+    const routing = this.route({
+      domain: "tool-use",
+      policy: this.options.policies.capabilityArguments,
+      serializedInput: input,
+      estimatedOutputTokens: 220,
+    });
+    return this.gateway.selectCapabilityArguments({ ...input, modelId: routing.modelId });
   }
 
   async interpretObservation(input: Parameters<typeof interpretObservation>[0]): Promise<Awaited<ReturnType<typeof interpretObservation>>> {
@@ -121,6 +141,16 @@ export class AdaptiveIntelligenceGateway {
       estimatedOutputTokens: 180,
     });
     return this.gateway.summarizeTask({ ...input, modelId: routing.modelId });
+  }
+
+  async generatePlan(input: Parameters<typeof generatePlan>[0]): Promise<Awaited<ReturnType<typeof generatePlan>>> {
+    const routing = this.route({
+      domain: "planning",
+      policy: this.options.policies.plan,
+      serializedInput: input,
+      estimatedOutputTokens: 900,
+    });
+    return this.gateway.generatePlan({ ...input, modelId: routing.modelId });
   }
 
   private route(input: RoutedInput): RoutingDecision {
