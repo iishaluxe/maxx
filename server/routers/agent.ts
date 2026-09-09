@@ -22,10 +22,11 @@ import {
 import { alertOwner } from "../agent/ownerAlerts";
 import { CapabilityBroker, ExecutionRouter } from "../agent/execution";
 import { E2BCloudSandboxAdapter } from "../agent/e2bAdapter";
-import { generatePlan, getAvailableModels } from "../agent/modelGateway";
+import { getAvailableModels } from "../agent/modelGateway";
 import { assessBudget, canTransition, evaluateCapabilityPolicy, type TaskStatus } from "../agent/policy";
 import { capabilityRegistry, executionTargets } from "../agent/registry";
 import { runDurableTask } from "../agent/runtime/durableTaskRunner";
+import { taskIntelligenceGateway } from "../agent/intelligenceRouting";
 import { notifyOwner } from "../_core/notification";
 import { protectedProcedure, router } from "../_core/trpc";
 import { storagePut } from "../storage";
@@ -84,7 +85,7 @@ export const agentRouter = router({
     await appendExecutionEvent({ taskId: task.id, kind: "planner.started", level: "info", title: "Planner started", content: "The model gateway is generating a structured plan without executing any capability." });
 
     try {
-      const result = await generatePlan({
+      const result = await taskIntelligenceGateway.generatePlan({
         goal: task.goal,
         executionTarget: task.executionTarget,
         modelId: task.modelId,
