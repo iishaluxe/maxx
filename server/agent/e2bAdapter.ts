@@ -1,7 +1,30 @@
 import { Sandbox } from "e2b";
+import { nanoid } from "nanoid";
+import { storagePut } from "../storage";
 import type { CapabilityObservation, CapabilityRequest, ExecutionAdapter } from "./execution";
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const BROWSER_INSTALL_TIMEOUT_MS = 3 * 60 * 1000;
+const BROWSER_NAVIGATE_TIMEOUT_MS = 45_000;
+const BROWSER_PAGE_TIMEOUT_MS = 30_000;
+
+// Ranges a sandbox should never be able to reach directly, even once it has
+// real internet access for browsing: RFC1918 private space, loopback,
+// link-local (this also covers the common cloud-metadata endpoint at
+// 169.254.169.254), CGNAT, and their IPv6 equivalents. Enforced at the
+// network layer by E2B (see sandboxFor), not just checked in application
+// code, so it can't be bypassed by a redirect or DNS trick after the fact.
+const BLOCKED_EGRESS_CIDRS = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "100.64.0.0/10",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
+];
 
 function requireString(input: Record<string, unknown>, key: string) {
   const value = input[key];
@@ -15,10 +38,75 @@ function commandOutput(result: { stdout: string; stderr: string; exitCode: numbe
   return [result.stdout, result.stderr, result.error].filter(Boolean).join("\n").trim();
 }
 
+function assertNavigableUrl(raw: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`"${raw}" is not a valid URL.`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`Only http/https URLs can be navigated to (got "${parsed.protocol}").`);
+  }
+  return parsed;
+}
+
+// Runs inside the sandbox via `node <script> <argsFile>`. Arguments are read
+// from a JSON file rather than argv/env so a URL containing quotes or shell
+// metacharacters can never be interpreted by the shell that invokes it.
+const NAVIGATE_SCRIPT = `
+const fs = require("fs");
+const { chromium } = require("playwright");
+
+async function main() {
+  const args = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+    let response = null;
+    let navigationError = null;
+    try {
+      response = await page.goto(args.url, { waitUntil: "networkidle", timeout: args.timeoutMs });
+    } catch (err) {
+      navigationError = err instanceof Error ? err.message : String(err);
+    }
+    const title = await page.title().catch(() => "");
+    const finalUrl = page.url();
+    const textExcerpt = await page
+      .evaluate(() => (document.body ? document.body.innerText : ""))
+      .catch(() => "");
+    await page.screenshot({ path: args.screenshotPath }).catch(() => {});
+    process.stdout.write(JSON.stringify({
+      finalUrl,
+      title,
+      status: response ? response.status() : null,
+      textExcerpt: textExcerpt.slice(0, 2000),
+      navigationError,
+    }));
+  } finally {
+    await browser.close();
+  }
+}
+
+main().catch(err => {
+  process.stderr.write(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});
+`;
+
+type NavigateResult = {
+  finalUrl: string;
+  title: string;
+  status: number | null;
+  textExcerpt: string;
+  navigationError: string | null;
+};
+
 export class E2BCloudSandboxAdapter implements ExecutionAdapter {
   readonly id = "e2b-cloud-sandbox";
   readonly target = "cloud_sandbox" as const;
   private readonly sandboxes = new Map<string, Sandbox>();
+  private readonly browserRuntimeReady = new Set<string>();
 
   isConfigured() {
     return Boolean(process.env.E2B_API_KEY);
@@ -33,11 +121,81 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
       apiKey,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       secure: true,
-      allowInternetAccess: false,
+      network: { denyOut: BLOCKED_EGRESS_CIDRS },
       metadata: { aegisTaskId: taskId, runtime: "aegis-computer" },
     });
     this.sandboxes.set(taskId, sandbox);
     return sandbox;
+  }
+
+  // Installs Playwright + a Chromium binary the first time a task calls
+  // browser.navigate. This is a real, potentially slow (60-180s) network
+  // operation on cold start; cached per taskId so it happens at most once
+  // per sandbox lifetime. See INSTRUCTIONS.md for the operational
+  // assumptions this makes about the sandbox's base image.
+  private async ensureBrowserRuntime(sandbox: Sandbox, taskId: string) {
+    if (this.browserRuntimeReady.has(taskId)) return;
+    const result = await sandbox.commands.run(
+      "npm install --no-save --no-audit --no-fund playwright && npx --yes playwright install --with-deps chromium",
+      { timeoutMs: BROWSER_INSTALL_TIMEOUT_MS }
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Could not install the browser runtime in the sandbox: ${commandOutput(result) || `exit code ${result.exitCode}`}`
+      );
+    }
+    this.browserRuntimeReady.add(taskId);
+  }
+
+  private async navigate(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: string[] }> {
+    const url = assertNavigableUrl(requireString(request.arguments, "url"));
+    await this.ensureBrowserRuntime(sandbox, request.taskId);
+
+    const runId = nanoid();
+    const scriptPath = `/tmp/aegis_navigate_${runId}.js`;
+    const argsPath = `/tmp/aegis_navigate_${runId}.args.json`;
+    const screenshotPath = `/tmp/aegis_navigate_${runId}.png`;
+
+    await sandbox.files.write(scriptPath, NAVIGATE_SCRIPT);
+    await sandbox.files.write(
+      argsPath,
+      JSON.stringify({ url: url.toString(), screenshotPath, timeoutMs: BROWSER_PAGE_TIMEOUT_MS })
+    );
+
+    const result = await sandbox.commands.run(`node ${scriptPath} ${argsPath}`, {
+      timeoutMs: BROWSER_NAVIGATE_TIMEOUT_MS,
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(`Browser navigation failed: ${commandOutput(result) || `exit code ${result.exitCode}`}`);
+    }
+
+    let parsed: NavigateResult;
+    try {
+      parsed = JSON.parse(result.stdout.trim());
+    } catch {
+      throw new Error(`Browser navigation returned an unexpected result: ${result.stdout.slice(0, 500)}`);
+    }
+
+    if (parsed.navigationError) {
+      throw new Error(`Navigation to ${url.toString()} did not complete: ${parsed.navigationError}`);
+    }
+
+    const screenshotBytes = await sandbox.files.read(screenshotPath, { format: "bytes" });
+    const screenshotKey = `agent-computer/${request.taskId}/browser-evidence/${runId}.png`;
+    const { url: screenshotUrl } = await storagePut(screenshotKey, screenshotBytes, "image/png");
+
+    const output = [
+      `Navigated to ${parsed.finalUrl} (status ${parsed.status ?? "unknown"}).`,
+      `Title: ${parsed.title || "(none)"}`,
+      parsed.textExcerpt ? `Page text (excerpt): ${parsed.textExcerpt.slice(0, 500)}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return {
+      output,
+      evidence: [`final_url:${parsed.finalUrl}`, `http_status:${parsed.status ?? "unknown"}`, `screenshot:${screenshotUrl}`],
+    };
   }
 
   async execute(request: CapabilityRequest): Promise<CapabilityObservation> {
@@ -85,12 +243,20 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
           evidence = [...evidence, `directory_listed:${path}`];
           break;
         }
+        case "browser.navigate": {
+          const navResult = await this.navigate(sandbox, request);
+          output = navResult.output;
+          evidence = [...evidence, ...navResult.evidence];
+          break;
+        }
         case "process.stop":
         case "artifact.pack":
-        case "browser.navigate":
-        case "browser.interact":
         case "secret.inject":
           throw new Error(`${request.capability} is not yet implemented by the E2B adapter.`);
+        case "browser.interact":
+          throw new Error(
+            "browser.interact is not implemented: CapabilityArguments (server/agent/modelGateway.ts) has no field for a target selector, interaction type, or value -- only command/path/content/url/notes, and the structured-output schema forbids extra fields. Extend that schema and the selectCapabilityArguments prompt before wiring this case."
+          );
         default:
           throw new Error(`Unsupported capability ${request.capability}.`);
       }
@@ -115,6 +281,7 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
       await sandbox.kill();
     } finally {
       this.sandboxes.delete(taskId);
+      this.browserRuntimeReady.delete(taskId);
     }
   }
 }
