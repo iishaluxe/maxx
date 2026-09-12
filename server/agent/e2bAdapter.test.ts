@@ -245,3 +245,139 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(state.sandboxCreateOpts).toHaveLength(0);
   });
 });
+
+describe("E2BCloudSandboxAdapter http.request", () => {
+  function httpRequest(overrides: Partial<CapabilityRequest> = {}): CapabilityRequest {
+    return baseRequest({ capability: "http.request", arguments: { url: "https://example.com" }, ...overrides });
+  }
+
+  it("uses the same private-range denylist as every other capability (no per-capability network config)", async () => {
+    state.commandResponder = () => ({
+      stdout: JSON.stringify({ status: 200, contentType: "text/plain", location: null, body: "hello", truncated: false }),
+      stderr: "",
+      exitCode: 0,
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    await adapter.execute(httpRequest({ taskId: "task-12" }));
+
+    const opts = state.sandboxCreateOpts[0] as { allowInternetAccess?: boolean; network?: { denyOut?: string[] } };
+    expect(opts.allowInternetAccess).toBeUndefined();
+    expect(opts.network?.denyOut).toEqual(expect.arrayContaining(["10.0.0.0/8", "169.254.0.0/16"]));
+  });
+
+  it("rejects an unparseable url before touching the sandbox", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(httpRequest({ taskId: "task-13", arguments: { url: "not a url" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(state.commandCalls).toHaveLength(0);
+  });
+
+  it("rejects a non-http(s) scheme before touching the sandbox", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(httpRequest({ taskId: "task-14", arguments: { url: "file:///etc/passwd" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(state.commandCalls).toHaveLength(0);
+  });
+
+  it("rejects an unsupported HTTP method before touching the sandbox", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(httpRequest({ taskId: "task-15", arguments: { url: "https://example.com", method: "TRACE" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(state.commandCalls).toHaveLength(0);
+  });
+
+  it("runs a generated script in the sandbox and reports a completed observation", async () => {
+    state.commandResponder = () => ({
+      stdout: JSON.stringify({ status: 200, contentType: "text/plain", location: null, body: "hello", truncated: false }),
+      stderr: "",
+      exitCode: 0,
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(httpRequest({ taskId: "task-16", arguments: { url: "https://example.com/data" } }));
+
+    expect(obs.outcome).toBe("completed");
+    expect(obs.evidence).toContain("http_status:200");
+    expect(obs.evidence).toContain("http_url:https://example.com/data");
+    expect(obs.output).toContain("hello");
+
+    const scriptCommand = state.commandCalls.find(c => c.command.startsWith("node "));
+    expect(scriptCommand?.command).toMatch(/^node \/tmp\/aegis-http-.*\.cjs$/);
+
+    const scriptWrite = state.fileWrites.find(w => w.path.endsWith(".cjs"));
+    expect(scriptWrite).toBeTruthy();
+    expect(scriptWrite!.data).toContain('redirect: "manual"');
+    expect(scriptWrite!.data).toContain("https://example.com/data");
+  });
+
+  it("does not embed a body for GET even if one is supplied", async () => {
+    state.commandResponder = () => ({
+      stdout: JSON.stringify({ status: 200, contentType: "text/plain", location: null, body: "", truncated: false }),
+      stderr: "",
+      exitCode: 0,
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    await adapter.execute(httpRequest({ taskId: "task-17", arguments: { url: "https://example.com", method: "GET", body: "ignored" } }));
+
+    const scriptWrite = state.fileWrites.find(w => w.path.endsWith(".cjs"));
+    expect(scriptWrite!.data).toContain("const BODY = undefined;");
+  });
+
+  it("embeds a body for POST", async () => {
+    state.commandResponder = () => ({
+      stdout: JSON.stringify({ status: 201, contentType: "application/json", location: null, body: "{}", truncated: false }),
+      stderr: "",
+      exitCode: 0,
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    await adapter.execute(httpRequest({ taskId: "task-18", arguments: { url: "https://example.com/items", method: "POST", body: '{"name":"a"}' } }));
+
+    const scriptWrite = state.fileWrites.find(w => w.path.endsWith(".cjs"));
+    expect(scriptWrite!.data).toContain(JSON.stringify('{"name":"a"}'));
+  });
+
+  it("reports the redirect target as evidence instead of following it", async () => {
+    state.commandResponder = () => ({
+      stdout: JSON.stringify({ status: 302, contentType: "", location: "https://example.com/next", body: "", truncated: false }),
+      stderr: "",
+      exitCode: 0,
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(httpRequest({ taskId: "task-19", arguments: { url: "https://example.com/start" } }));
+
+    expect(obs.outcome).toBe("completed");
+    expect(obs.evidence).toContain("http_redirect_location:https://example.com/next");
+    expect(obs.output).toContain("not followed automatically");
+  });
+
+  it("surfaces an in-sandbox safety rejection (e.g. a private address) as a failed observation", async () => {
+    state.commandResponder = () => ({
+      stdout: JSON.stringify({ error: "Refusing to request a private, loopback, or link-local address." }),
+      stderr: "",
+      exitCode: 1,
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(httpRequest({ taskId: "task-20", arguments: { url: "http://169.254.169.254/latest/meta-data" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("private, loopback, or link-local");
+  });
+
+  it("falls back to raw command output when the script produces no parsable JSON", async () => {
+    state.commandResponder = () => ({ stdout: "not json", stderr: "some stderr", exitCode: 1 });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(httpRequest({ taskId: "task-21" }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("not json");
+  });
+});
