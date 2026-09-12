@@ -26,6 +26,7 @@ export type CapabilityName =
   | "artifact.pack"
   | "browser.navigate"
   | "browser.interact"
+  | "http.request"
   | "secret.inject";
 
 export type PolicyDecision = {

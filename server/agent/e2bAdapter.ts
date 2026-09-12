@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Sandbox } from "e2b";
 import { nanoid } from "nanoid";
 import { storagePut } from "../storage";
@@ -49,6 +50,130 @@ function assertNavigableUrl(raw: string): URL {
     throw new Error(`Only http/https URLs can be navigated to (got "${parsed.protocol}").`);
   }
   return parsed;
+}
+
+const ALLOWED_HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
+const HTTP_METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const HTTP_RESPONSE_BODY_LIMIT = 8000;
+const HTTP_REQUEST_TIMEOUT_MS = 20_000;
+
+type HttpScriptResult = {
+  status?: number;
+  contentType?: string;
+  location?: string | null;
+  body?: string;
+  truncated?: boolean;
+  error?: string;
+};
+
+/**
+ * Builds a standalone CommonJS script (run inside the sandbox via `node`,
+ * not evaluated on the host) that performs the actual outbound request.
+ *
+ * This has to run inside the sandbox, not on the host, for two reasons:
+ * 1. Isolation — the host process is trusted infrastructure; agent-directed
+ *    outbound requests must originate from the disposable, already-isolated
+ *    sandbox, never from the platform's own network position.
+ * 2. Correctness — the private/loopback/link-local check below resolves
+ *    DNS and inspects the resolved address. That resolution has to happen
+ *    in the same network namespace the request will actually be sent from.
+ *    A host-side-only DNS check could pass while the sandbox's own
+ *    resolution (different DNS, different routing) reaches something else.
+ *
+ * This is deliberately a *second*, independent layer on top of the
+ * sandbox-level `network.denyOut` CIDR block already applied in
+ * sandboxFor(): that layer is enforced by E2B itself and is immune to a
+ * DNS-rebinding race between this check and the actual `fetch()` call
+ * below (which re-resolves DNS itself); this in-script check exists so
+ * the failure is attributed clearly to the request itself in evidence,
+ * not just silently dropped at the network layer.
+ *
+ * `redirect: "manual"` is deliberate: auto-following redirects would let a
+ * server respond 302 to a private address and bypass the check entirely.
+ * The redirect target is reported as evidence instead of being followed.
+ *
+ * Values are embedded via JSON.stringify (valid JS string-literal syntax),
+ * not string interpolation into a shell command, so there is no shell- or
+ * script-injection path from an attacker-influenced url/body.
+ */
+function buildHttpRequestScript(input: { url: string; method: string; body?: string }): string {
+  const includeBody = HTTP_METHODS_WITH_BODY.has(input.method) && input.body !== undefined;
+  return `
+"use strict";
+const dns = require("node:dns").promises;
+
+const TARGET_URL = ${JSON.stringify(input.url)};
+const METHOD = ${JSON.stringify(input.method)};
+const BODY = ${includeBody ? JSON.stringify(input.body) : "undefined"};
+const RESPONSE_LIMIT = ${HTTP_RESPONSE_BODY_LIMIT};
+const TIMEOUT_MS = ${HTTP_REQUEST_TIMEOUT_MS};
+
+function isPrivateAddress(address, family) {
+  if (family === 4 || (address.indexOf(":") === -1 && address.indexOf(".") !== -1)) {
+    const parts = address.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return true;
+    const a = parts[0], b = parts[1];
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true; // includes cloud metadata (169.254.169.254)
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+    return false;
+  }
+  const a = address.toLowerCase();
+  if (a === "::1" || a === "::") return true;
+  if (/^fe[89ab]/.test(a)) return true; // link-local fe80::/10
+  if (a.startsWith("fc") || a.startsWith("fd")) return true; // unique local fc00::/7
+  if (a.startsWith("::ffff:")) return isPrivateAddress(a.slice(7), 4);
+  return false;
+}
+
+async function main() {
+  let url;
+  try {
+    url = new URL(TARGET_URL);
+  } catch {
+    throw new Error("The url argument could not be parsed as a valid URL.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Only http:// and https:// URLs are permitted.");
+  }
+
+  let resolved;
+  try {
+    resolved = await dns.lookup(url.hostname, { all: true, verbatim: true });
+  } catch (error) {
+    throw new Error("Could not resolve the target host: " + ((error && error.message) || error));
+  }
+  if (!resolved.length) throw new Error("The target host did not resolve to any address.");
+  for (const entry of resolved) {
+    if (isPrivateAddress(entry.address, entry.family)) {
+      throw new Error("Refusing to request a private, loopback, or link-local address.");
+    }
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { method: METHOD, body: BODY, redirect: "manual", signal: controller.signal });
+    const text = await response.text();
+    process.stdout.write(JSON.stringify({
+      status: response.status,
+      contentType: response.headers.get("content-type") || "",
+      location: response.headers.get("location") || null,
+      body: text.slice(0, RESPONSE_LIMIT),
+      truncated: text.length > RESPONSE_LIMIT,
+    }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+main().catch((error) => {
+  process.stdout.write(JSON.stringify({ error: (error && error.message) || String(error) }));
+  process.exitCode = 1;
+});
+`.trim();
 }
 
 // Runs inside the sandbox via `node <script> <argsFile>`. Arguments are read
@@ -249,6 +374,66 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
           output = navResult.output;
           evidence = [...evidence, ...navResult.evidence];
           break;
+        }
+        case "http.request": {
+          const url = requireString(request.arguments, "url");
+          const method = typeof request.arguments.method === "string" ? request.arguments.method.toUpperCase() : "GET";
+          if (!ALLOWED_HTTP_METHODS.has(method)) {
+            throw new Error(`Unsupported HTTP method "${method}".`);
+          }
+          let parsedUrl: URL;
+          try {
+            parsedUrl = new URL(url);
+          } catch {
+            throw new Error("The url argument could not be parsed as a valid URL.");
+          }
+          if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+            throw new Error("Only http:// and https:// URLs are permitted for http.request.");
+          }
+          const body = typeof request.arguments.body === "string" ? request.arguments.body : undefined;
+
+          const scriptPath = `/tmp/aegis-http-${randomUUID()}.cjs`;
+          await sandbox.files.write(scriptPath, buildHttpRequestScript({ url, method, body }));
+          const result = await sandbox.commands.run(`node ${scriptPath}`, { timeoutMs: HTTP_REQUEST_TIMEOUT_MS + 5_000 });
+
+          let parsed: HttpScriptResult | null = null;
+          try {
+            parsed = JSON.parse(result.stdout.trim()) as HttpScriptResult;
+          } catch {
+            parsed = null;
+          }
+
+          evidence = [...evidence, `http_url:${url}`, `http_method:${method}`];
+          if (!parsed || parsed.error) {
+            return {
+              outcome: "failed",
+              output: parsed?.error || commandOutput(result) || "The http.request script produced no parsable output.",
+              evidence,
+              adapterId: this.id,
+              startedAt,
+              completedAt: new Date(),
+            };
+          }
+
+          evidence = [...evidence, `http_status:${parsed.status}`];
+          if (parsed.location) evidence = [...evidence, `http_redirect_location:${parsed.location}`];
+
+          const summaryLines = [
+            `HTTP ${parsed.status} (${parsed.contentType || "unknown content type"})`,
+            parsed.location ? `Response was a redirect to ${parsed.location} — not followed automatically.` : "",
+            parsed.truncated ? `Response body truncated to ${HTTP_RESPONSE_BODY_LIMIT} characters.` : "",
+            "",
+            parsed.body || "",
+          ].filter(line => line !== "").join("\n").trim();
+
+          return {
+            outcome: "completed",
+            output: summaryLines,
+            evidence,
+            adapterId: this.id,
+            startedAt,
+            completedAt: new Date(),
+          };
         }
         case "process.stop":
         case "artifact.pack":

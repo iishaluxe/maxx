@@ -68,7 +68,7 @@ const PLAN_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-const plannerSystemPrompt = `You are the planning component of a secure autonomous computer platform. Create an execution plan only; do not claim to execute any step. Use the available capability names exactly when possible: shell.exec, filesystem.read, filesystem.write, filesystem.list, process.start, process.stop, package.install, git.operation, artifact.pack, browser.navigate, browser.interact, secret.inject. Treat secrets as references only, never values. Mark any side-effecting, credential, local-computer, publishing, deletion, or submission activity as medium or high risk. Every step must state independently observable evidence.`;
+const plannerSystemPrompt = `You are the planning component of a secure autonomous computer platform. Create an execution plan only; do not claim to execute any step. Use the available capability names exactly when possible: shell.exec, filesystem.read, filesystem.write, filesystem.list, process.start, process.stop, package.install, git.operation, artifact.pack, browser.navigate, browser.interact, http.request, secret.inject. Treat secrets as references only, never values. Mark any side-effecting, credential, local-computer, publishing, deletion, or submission activity as medium or high risk. Every step must state independently observable evidence.`;
 
 const executiveSystemPrompt = `You are a secure agent-runtime reasoning component. Do not claim that any command, browser action, or external side effect occurred unless the observation explicitly proves it. Never request raw secrets; use only secret:// reference identifiers. Do not bypass policy, approval, budgets, or verification gates.`;
 
@@ -232,6 +232,10 @@ export type CapabilityArguments = {
   path?: string;
   content?: string;
   url?: string;
+  /** http.request only. Defaults to GET when absent. */
+  method?: string;
+  /** http.request only, for methods that accept a body (not GET/HEAD). */
+  body?: string;
   notes?: string;
 };
 
@@ -257,11 +261,13 @@ export async function selectCapabilityArguments(input: {
         path: { type: "string" },
         content: { type: "string" },
         url: { type: "string" },
+        method: { type: "string", enum: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] },
+        body: { type: "string" },
         notes: { type: "string" },
       },
       additionalProperties: false,
     },
-    prompt: `Goal:\n${input.taskGoal}\n\nStep to perform now:\nTitle: ${input.step.title}\nDescription: ${input.step.description}\nCapability: ${input.step.capability}\nExpected evidence: ${input.step.expectedEvidence}\n\nPrior observations:\n${input.priorObservations.join("\n") || "None"}\n\nReturn only the fields this specific capability needs (for example "command" for shell.exec/process.start/package.install/git.operation, or "path" and "content" for filesystem writes, or "path" for filesystem reads/listings). Never include a raw secret value; use a secret:// reference string if a credential is required. Leave unrelated fields absent.`,
+    prompt: `Goal:\n${input.taskGoal}\n\nStep to perform now:\nTitle: ${input.step.title}\nDescription: ${input.step.description}\nCapability: ${input.step.capability}\nExpected evidence: ${input.step.expectedEvidence}\n\nPrior observations:\n${input.priorObservations.join("\n") || "None"}\n\nReturn only the fields this specific capability needs (for example "command" for shell.exec/process.start/package.install/git.operation, or "path" and "content" for filesystem writes, or "path" for filesystem reads/listings, or "url" and optionally "method"/"body" for http.request — method defaults to GET, and body is only meaningful for POST/PUT/PATCH). Custom headers and authenticated requests are not supported yet: http.request cannot carry a secret:// reference, so never select it for a call that needs credentials. Never include a raw secret value. Leave unrelated fields absent.`,
   });
 }
 

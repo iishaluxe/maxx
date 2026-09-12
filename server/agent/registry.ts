@@ -4,7 +4,7 @@ export type CapabilityDefinition = {
   name: CapabilityName;
   label: string;
   description: string;
-  category: "computer" | "workspace" | "browser" | "trust" | "delivery";
+  category: "computer" | "workspace" | "browser" | "network" | "trust" | "delivery";
   approvalSensitive: boolean;
 };
 
@@ -20,6 +20,7 @@ export const capabilityRegistry: CapabilityDefinition[] = [
   { name: "artifact.pack", label: "Package artifact", description: "Create an evidence-backed deliverable and provenance record.", category: "delivery", approvalSensitive: false },
   { name: "browser.navigate", label: "Browser navigation", description: "Navigate through a structured browser session.", category: "browser", approvalSensitive: false },
   { name: "browser.interact", label: "Browser interaction", description: "Perform a state-changing browser interaction with evidence capture.", category: "browser", approvalSensitive: true },
+  { name: "http.request", label: "HTTP request", description: "Make an outbound HTTP request from inside the sandbox and capture the response.", category: "network", approvalSensitive: false },
   { name: "secret.inject", label: "Secret reference", description: "Inject an approved secret reference at execution time without returning its raw value.", category: "trust", approvalSensitive: true },
 ];
 
