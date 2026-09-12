@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Sandbox } from "e2b";
 import { nanoid } from "nanoid";
 import { storagePut } from "../storage";
+import { callDataApi } from "../_core/dataApi";
 import type { CapabilityObservation, CapabilityRequest, ExecutionAdapter } from "./execution";
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -174,6 +175,91 @@ main().catch((error) => {
   process.exitCode = 1;
 });
 `.trim();
+}
+
+// -----------------------------------------------------------------------
+// search.query
+//
+// UNLIKE http.request and browser.navigate, this does NOT run inside the
+// sandbox. It calls callDataApi() directly from the host (Aegis server
+// process) -- the same process that already calls storagePut() for
+// screenshot evidence. That's deliberate, not an inconsistency: Forge
+// credentials (BUILT_IN_FORGE_API_URL/KEY) are a trusted, platform-level
+// secret in the same class as DATABASE_URL -- they must never be written
+// into the sandbox's filesystem or environment, since shell.exec runs
+// arbitrary agent-directed commands in that same sandbox and could
+// exfiltrate or misuse a credential that leaked into it. The sandbox
+// still gets acquired via sandboxFor() before this runs (see execute()),
+// for evidence consistency with every other capability, but its network
+// access is never involved in the actual search call.
+//
+// NEEDS LIVE CONFIRMATION: the only confirmed Forge Data API precedent
+// anywhere in this codebase is the "Youtube/search" example in
+// server/_core/dataApi.ts's docstring. There is no documentation here of
+// a general web-search apiId. "Google/search" below is a best guess
+// following that Provider/action naming convention -- it has not been
+// tested against a real Forge account (no network access in this
+// authoring environment). If it's wrong, every search.query call will
+// fail cleanly (a normal `failed` observation with Forge's real error
+// message surfaced, not a crash) until this one constant is corrected.
+// Test it live and fix this line if needed -- that's the only unverified
+// piece of this capability.
+const FORGE_SEARCH_API_ID = "Google/search";
+
+type NormalizedSearchResult = { title: string; url: string; snippet: string };
+
+// Defensive on purpose: the real response shape for FORGE_SEARCH_API_ID
+// is unconfirmed (see above), so this tries several plausible shapes
+// rather than assuming one. If none match, it falls back to returning
+// the raw payload as text instead of throwing -- a search.query call
+// should never crash just because the response parser's guess about the
+// shape was wrong; the model can still work from raw JSON text.
+function normalizeSearchResults(payload: unknown): { results: NormalizedSearchResult[]; raw?: string } {
+  const candidates: unknown[] = [];
+  if (payload && typeof payload === "object") {
+    const obj = payload as Record<string, unknown>;
+    for (const key of ["results", "items", "organic", "organic_results", "webPages"]) {
+      const value = key === "webPages" ? (obj.webPages as Record<string, unknown> | undefined)?.value : obj[key];
+      if (Array.isArray(value)) candidates.push(...value);
+    }
+  } else if (Array.isArray(payload)) {
+    candidates.push(...payload);
+  }
+
+  const results: NormalizedSearchResult[] = [];
+  for (const item of candidates) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const title = [row.title, row.name, row.heading].find((v): v is string => typeof v === "string") || "";
+    const url = [row.url, row.link, row.href].find((v): v is string => typeof v === "string") || "";
+    const snippet = [row.snippet, row.description, row.summary].find((v): v is string => typeof v === "string") || "";
+    if (url) results.push({ title, url, snippet });
+  }
+
+  if (results.length > 0) return { results };
+  return { results: [], raw: JSON.stringify(payload).slice(0, 2000) };
+}
+
+async function queryForgeSearch(query: string): Promise<{ output: string; evidence: string[] }> {
+  const payload = await callDataApi(FORGE_SEARCH_API_ID, { query: { q: query } });
+  const normalized = normalizeSearchResults(payload);
+
+  if (normalized.results.length === 0) {
+    const output = normalized.raw
+      ? `No structured results could be parsed from the search response. Raw response (truncated):\n${normalized.raw}`
+      : "The search returned no results.";
+    return { output, evidence: [`search_query:${query}`, `search_result_count:0`] };
+  }
+
+  const output = normalized.results
+    .slice(0, 10)
+    .map((r, i) => `${i + 1}. ${r.title || "(untitled)"}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`)
+    .join("\n\n");
+
+  return {
+    output,
+    evidence: [`search_query:${query}`, `search_result_count:${normalized.results.length}`],
+  };
 }
 
 // Runs inside the sandbox via `node <script> <argsFile>`. Arguments are read
@@ -434,6 +520,13 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
             startedAt,
             completedAt: new Date(),
           };
+        }
+        case "search.query": {
+          const query = requireString(request.arguments, "query");
+          const searchResult = await queryForgeSearch(query);
+          output = searchResult.output;
+          evidence = [...evidence, ...searchResult.evidence];
+          break;
         }
         case "process.stop":
         case "artifact.pack":

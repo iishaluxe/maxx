@@ -145,7 +145,7 @@ export const agentRouter = router({
 
   requestApproval: protectedProcedure.input(z.object({
     taskId: z.string().min(1),
-    capability: z.enum(["shell.exec", "filesystem.read", "filesystem.write", "filesystem.list", "process.start", "process.stop", "package.install", "git.operation", "artifact.pack", "browser.navigate", "browser.interact", "http.request", "secret.inject"]),
+    capability: z.enum(["shell.exec", "filesystem.read", "filesystem.write", "filesystem.list", "process.start", "process.stop", "package.install", "git.operation", "artifact.pack", "browser.navigate", "browser.interact", "http.request", "search.query", "secret.inject"]),
     action: z.string().min(3).max(240),
     rationale: z.string().min(3).max(5000),
     risk: z.enum(["medium", "high", "critical"]),
@@ -189,7 +189,7 @@ export const agentRouter = router({
 
   executeCapability: protectedProcedure.input(z.object({
     taskId: z.string().min(1),
-    capability: z.enum(["shell.exec", "filesystem.read", "filesystem.write", "filesystem.list", "process.start", "process.stop", "package.install", "git.operation", "artifact.pack", "browser.navigate", "browser.interact", "http.request", "secret.inject"]),
+    capability: z.enum(["shell.exec", "filesystem.read", "filesystem.write", "filesystem.list", "process.start", "process.stop", "package.install", "git.operation", "artifact.pack", "browser.navigate", "browser.interact", "http.request", "search.query", "secret.inject"]),
     action: z.string().min(3).max(240),
     arguments: z.record(z.string(), z.unknown()),
     destructive: z.boolean().default(false),

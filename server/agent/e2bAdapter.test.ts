@@ -14,6 +14,8 @@ const state = vi.hoisted(() => ({
     exitCode: 0,
   }),
   fileReadResponder: (_path: string): Uint8Array => new Uint8Array([1, 2, 3, 4]),
+  dataApiCalls: [] as Array<{ apiId: string; query?: Record<string, unknown> }>,
+  dataApiResponder: (_apiId: string, _query?: Record<string, unknown>): unknown => ({ results: [] }),
 }));
 
 // Fakes the `e2b` SDK entirely -- no real sandbox and no real credential
@@ -51,6 +53,13 @@ vi.mock("e2b", () => ({
 }));
 
 vi.mock("nanoid", () => ({ nanoid: () => "fixedid" }));
+
+vi.mock("../_core/dataApi", () => ({
+  callDataApi: async (apiId: string, options: { query?: Record<string, unknown> }) => {
+    state.dataApiCalls.push({ apiId, query: options.query });
+    return state.dataApiResponder(apiId, options.query);
+  },
+}));
 
 vi.mock("../storage", () => ({
   storagePut: async (key: string, _data: Uint8Array | string, contentType: string) => {
@@ -101,6 +110,8 @@ beforeEach(() => {
   state.sandboxCreateOpts = [];
   state.commandResponder = () => ({ stdout: "", stderr: "", exitCode: 0 });
   state.fileReadResponder = () => new Uint8Array([1, 2, 3, 4]);
+  state.dataApiCalls = [];
+  state.dataApiResponder = () => ({ results: [] });
 });
 
 afterEach(() => {
@@ -379,5 +390,87 @@ describe("E2BCloudSandboxAdapter http.request", () => {
 
     expect(obs.outcome).toBe("failed");
     expect(obs.output).toContain("not json");
+  });
+});
+
+describe("E2BCloudSandboxAdapter search.query", () => {
+  function searchRequest(overrides: Partial<CapabilityRequest> = {}): CapabilityRequest {
+    return baseRequest({ capability: "search.query", arguments: { query: "aegis computer platform" }, ...overrides });
+  }
+
+  it("calls Forge's data API with the query and returns normalized results", async () => {
+    state.dataApiResponder = () => ({
+      results: [
+        { title: "Aegis Computer", url: "https://example.com/aegis", snippet: "An autonomous agent platform." },
+        { title: "Aegis docs", url: "https://example.com/aegis/docs", snippet: "Documentation." },
+      ],
+    });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(searchRequest({ taskId: "task-22" }));
+
+    expect(obs.outcome).toBe("completed");
+    expect(obs.evidence).toContain("search_query:aegis computer platform");
+    expect(obs.evidence).toContain("search_result_count:2");
+    expect(obs.output).toContain("Aegis Computer");
+    expect(obs.output).toContain("https://example.com/aegis/docs");
+    expect(state.dataApiCalls).toHaveLength(1);
+    expect(state.dataApiCalls[0].query).toEqual({ q: "aegis computer platform" });
+  });
+
+  it("recognizes several plausible response shapes (items, organic, webPages.value), not just 'results'", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+
+    state.dataApiResponder = () => ({ items: [{ name: "Item title", link: "https://example.com/item" }] });
+    let obs = await adapter.execute(searchRequest({ taskId: "task-23a" }));
+    expect(obs.outcome).toBe("completed");
+    expect(obs.evidence).toContain("search_result_count:1");
+
+    state.dataApiResponder = () => ({ webPages: { value: [{ name: "Bing-style title", url: "https://example.com/bing" }] } });
+    obs = await adapter.execute(searchRequest({ taskId: "task-23b" }));
+    expect(obs.outcome).toBe("completed");
+    expect(obs.evidence).toContain("search_result_count:1");
+  });
+
+  it("does not touch the sandbox's command or file APIs at all (runs on the host, not in the sandbox)", async () => {
+    state.dataApiResponder = () => ({ results: [{ title: "x", url: "https://example.com" }] });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    await adapter.execute(searchRequest({ taskId: "task-24" }));
+
+    expect(state.commandCalls).toHaveLength(0);
+    expect(state.fileWrites).toHaveLength(0);
+  });
+
+  it("fails cleanly when query is missing", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(searchRequest({ taskId: "task-25", arguments: {} }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("query is required");
+    expect(state.dataApiCalls).toHaveLength(0);
+  });
+
+  it("falls back to raw JSON instead of crashing when the response shape doesn't match any known format", async () => {
+    state.dataApiResponder = () => ({ somethingUnexpected: true });
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(searchRequest({ taskId: "task-26" }));
+
+    expect(obs.outcome).toBe("completed");
+    expect(obs.evidence).toContain("search_result_count:0");
+    expect(obs.output).toContain("somethingUnexpected");
+  });
+
+  it("surfaces callDataApi's own error as a failed observation (e.g. Forge not configured, or the apiId is wrong)", async () => {
+    state.dataApiResponder = () => {
+      throw new Error("BUILT_IN_FORGE_API_URL is not configured");
+    };
+    const adapter = new E2BCloudSandboxAdapter();
+
+    const obs = await adapter.execute(searchRequest({ taskId: "task-27" }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("BUILT_IN_FORGE_API_URL is not configured");
   });
 });

@@ -27,6 +27,7 @@ export type CapabilityName =
   | "browser.navigate"
   | "browser.interact"
   | "http.request"
+  | "search.query"
   | "secret.inject";
 
 export type PolicyDecision = {
