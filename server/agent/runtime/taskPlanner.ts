@@ -10,7 +10,7 @@ export type TaskPlannerContext = {
   modelId?: string | null;
 };
 
-function toCapabilityArgs(value: { command?: string; path?: string; content?: string; url?: string; method?: string; body?: string; query?: string }) {
+function toCapabilityArgs(value: { command?: string; path?: string; content?: string; url?: string; method?: string; body?: string; query?: string; selector?: string; interaction?: string; value?: string }) {
   const args: Record<string, unknown> = {};
   if (value.command !== undefined) args.command = value.command;
   if (value.path !== undefined) args.path = value.path;
@@ -19,6 +19,9 @@ function toCapabilityArgs(value: { command?: string; path?: string; content?: st
   if (value.method !== undefined) args.method = value.method;
   if (value.body !== undefined) args.body = value.body;
   if (value.query !== undefined) args.query = value.query;
+  if (value.selector !== undefined) args.selector = value.selector;
+  if (value.interaction !== undefined) args.interaction = value.interaction;
+  if (value.value !== undefined) args.value = value.value;
   return args;
 }
 
