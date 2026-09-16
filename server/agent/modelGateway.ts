@@ -238,6 +238,12 @@ export type CapabilityArguments = {
   body?: string;
   /** search.query only. The search query text. */
   query?: string;
+  /** browser.interact only. A CSS selector identifying the target element. */
+  selector?: string;
+  /** browser.interact only. One of: click, type, select, check, uncheck, hover. */
+  interaction?: string;
+  /** browser.interact only, for "type"/"select" interactions: the text to enter or option value to choose. */
+  value?: string;
   notes?: string;
 };
 
@@ -266,11 +272,14 @@ export async function selectCapabilityArguments(input: {
         method: { type: "string", enum: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] },
         body: { type: "string" },
         query: { type: "string" },
+        selector: { type: "string" },
+        interaction: { type: "string", enum: ["click", "type", "select", "check", "uncheck", "hover"] },
+        value: { type: "string" },
         notes: { type: "string" },
       },
       additionalProperties: false,
     },
-    prompt: `Goal:\n${input.taskGoal}\n\nStep to perform now:\nTitle: ${input.step.title}\nDescription: ${input.step.description}\nCapability: ${input.step.capability}\nExpected evidence: ${input.step.expectedEvidence}\n\nPrior observations:\n${input.priorObservations.join("\n") || "None"}\n\nReturn only the fields this specific capability needs (for example "command" for shell.exec/process.start/package.install/git.operation, or "path" and "content" for filesystem writes, or "path" for filesystem reads/listings, or "url" and optionally "method"/"body" for http.request — method defaults to GET, and body is only meaningful for POST/PUT/PATCH, or "query" for search.query). Custom headers and authenticated requests are not supported yet: http.request cannot carry a secret:// reference, so never select it for a call that needs credentials. Never include a raw secret value. Leave unrelated fields absent.`,
+    prompt: `Goal:\n${input.taskGoal}\n\nStep to perform now:\nTitle: ${input.step.title}\nDescription: ${input.step.description}\nCapability: ${input.step.capability}\nExpected evidence: ${input.step.expectedEvidence}\n\nPrior observations:\n${input.priorObservations.join("\n") || "None"}\n\nReturn only the fields this specific capability needs (for example "command" for shell.exec/process.start/package.install/git.operation, or "path" and "content" for filesystem writes, or "path" for filesystem reads/listings, or "url" and optionally "method"/"body" for http.request — method defaults to GET, and body is only meaningful for POST/PUT/PATCH, or "query" for search.query, or "selector" and "interaction" (and "value" for type/select) for browser.interact — interaction must be one of click/type/select/check/uncheck/hover, and browser.interact only affects the page already open from the most recent browser.navigate in this task, so navigate first if no page is open yet). Custom headers and authenticated requests are not supported yet: http.request cannot carry a secret:// reference, so never select it for a call that needs credentials. Never include a raw secret value. Leave unrelated fields absent.`,
   });
 }
 

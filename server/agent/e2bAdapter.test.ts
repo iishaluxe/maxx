@@ -8,14 +8,23 @@ const state = vi.hoisted(() => ({
   fileWrites: [] as Array<{ path: string; data: string }>,
   storagePutCalls: [] as Array<{ key: string; contentType: string }>,
   sandboxCreateOpts: [] as Array<Record<string, unknown>>,
-  commandResponder: (_command: string): { stdout: string; stderr: string; exitCode: number } => ({
-    stdout: "",
-    stderr: "",
-    exitCode: 0,
-  }),
+  commandResponder: (_command: string): CommandResult => ({ stdout: "", stderr: "", exitCode: 0 }),
   fileReadResponder: (_path: string): Uint8Array => new Uint8Array([1, 2, 3, 4]),
   dataApiCalls: [] as Array<{ apiId: string; query?: Record<string, unknown> }>,
   dataApiResponder: (_apiId: string, _query?: Record<string, unknown>): unknown => ({ results: [] }),
+  // browser.navigate/browser.interact both talk to a persistent in-sandbox
+  // server via a tiny client script; the mock inspects the args file each
+  // client-script command references to figure out which endpoint
+  // (/health, /navigate, /interact, /screenshot) is being called, and
+  // hands off to this responder. browserServerCalls is recorded
+  // automatically (not by the test's own responder) so tests can assert
+  // on which endpoints were actually hit regardless of what they return.
+  browserServerCalls: [] as Array<{ path: string; body: unknown }>,
+  browserServerResponder: (path: string, _body: unknown): unknown => {
+    if (path === "/health") return { ok: true };
+    if (path === "/screenshot") return { screenshotBase64: Buffer.from([1, 2, 3, 4]).toString("base64") };
+    return { ok: true };
+  },
 }));
 
 // Fakes the `e2b` SDK entirely -- no real sandbox and no real credential
@@ -24,9 +33,10 @@ const state = vi.hoisted(() => ({
 // so a fake value is stubbed in below purely to satisfy that check -- it is
 // never used to authenticate anything real.
 // This is a real-execution test of the adapter's own control flow (argument
-// validation, install caching, error surfacing, evidence assembly), not a
-// test of Playwright/Chromium actually working inside a live sandbox --
-// that can only be verified with a real E2B_API_KEY, which CI doesn't have.
+// validation, install/server-startup caching, error surfacing, evidence
+// assembly), not a test of Playwright/Chromium actually working inside a
+// live sandbox -- that can only be verified with a real E2B_API_KEY, which
+// CI doesn't have.
 vi.mock("e2b", () => ({
   Sandbox: {
     create: async (opts: Record<string, unknown>) => {
@@ -36,6 +46,21 @@ vi.mock("e2b", () => ({
         commands: {
           run: async (command: string, runOpts?: unknown) => {
             state.commandCalls.push({ command, opts: runOpts });
+
+            // Client-script calls look like: node <CLIENT_PATH> <argsPath>.
+            // The args file (written just before this command runs) carries
+            // {method, path, body} -- that's where the real request lives,
+            // not in the command string, which never contains anything
+            // derived from a url/selector/value at all.
+            if (command.startsWith("node ") && command.includes("aegis_browser_client")) {
+              const argsPath = command.trim().split(" ")[2];
+              const write = [...state.fileWrites].reverse().find(w => w.path === argsPath);
+              const args = write ? (JSON.parse(write.data) as { path: string; body?: unknown }) : { path: "", body: undefined };
+              state.browserServerCalls.push({ path: args.path, body: args.body });
+              const responseBody = state.browserServerResponder(args.path, args.body);
+              return { stdout: JSON.stringify(responseBody), stderr: "", exitCode: 0 };
+            }
+
             return state.commandResponder(command);
           },
         },
@@ -51,8 +76,6 @@ vi.mock("e2b", () => ({
     },
   },
 }));
-
-vi.mock("nanoid", () => ({ nanoid: () => "fixedid" }));
 
 vi.mock("../_core/dataApi", () => ({
   callDataApi: async (apiId: string, options: { query?: Record<string, unknown> }) => {
@@ -85,21 +108,6 @@ function successfulInstall(): CommandResult {
   return { stdout: "chromium installed", stderr: "", exitCode: 0 };
 }
 
-function successfulNavigate(overrides: Partial<{ finalUrl: string; title: string; status: number | null; textExcerpt: string; navigationError: string | null }> = {}): CommandResult {
-  return {
-    stdout: JSON.stringify({
-      finalUrl: "https://example.com/",
-      title: "Example Domain",
-      status: 200,
-      textExcerpt: "Example Domain text",
-      navigationError: null,
-      ...overrides,
-    }),
-    stderr: "",
-    exitCode: 0,
-  };
-}
-
 beforeEach(() => {
   // sandboxFor() throws before ever touching the (mocked) Sandbox.create if
   // this isn't set -- unrelated to whether a real E2B account exists.
@@ -112,6 +120,12 @@ beforeEach(() => {
   state.fileReadResponder = () => new Uint8Array([1, 2, 3, 4]);
   state.dataApiCalls = [];
   state.dataApiResponder = () => ({ results: [] });
+  state.browserServerCalls = [];
+  state.browserServerResponder = path => {
+    if (path === "/health") return { ok: true };
+    if (path === "/screenshot") return { screenshotBase64: Buffer.from([1, 2, 3, 4]).toString("base64") };
+    return { ok: true };
+  };
 });
 
 afterEach(() => {
@@ -119,9 +133,27 @@ afterEach(() => {
 });
 
 describe("E2BCloudSandboxAdapter browser.navigate", () => {
+  function navigateResponder(overrides: Partial<{ finalUrl: string; title: string; status: number | null; textExcerpt: string; navigationError: string | null }> = {}) {
+    return (path: string) => {
+      if (path === "/navigate") {
+        return {
+          finalUrl: "https://example.com/",
+          title: "Example Domain",
+          status: 200,
+          textExcerpt: "Example Domain text",
+          navigationError: null,
+          ...overrides,
+        };
+      }
+      if (path === "/health") return { ok: true };
+      if (path === "/screenshot") return { screenshotBase64: Buffer.from([1, 2, 3, 4]).toString("base64") };
+      return { ok: true };
+    };
+  }
+
   it("succeeds end to end and returns evidence with a screenshot URL", async () => {
-    state.commandResponder = command =>
-      command.includes("playwright install") ? successfulInstall() : successfulNavigate();
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = navigateResponder();
 
     const adapter = new E2BCloudSandboxAdapter();
     const obs = await adapter.execute(baseRequest({}));
@@ -134,8 +166,24 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(state.storagePutCalls[0].contentType).toBe("image/png");
   });
 
+  it("starts the persistent browser server as a background process, once, and waits for it to report healthy", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = navigateResponder();
+
+    const adapter = new E2BCloudSandboxAdapter();
+    await adapter.execute(baseRequest({ taskId: "task-1b" }));
+
+    const serverStart = state.commandCalls.find(c => c.command.includes("aegis_browser_server.js") && c.command.startsWith("node"));
+    expect(serverStart).toBeTruthy();
+    expect((serverStart!.opts as { background?: boolean })?.background).toBe(true);
+
+    const healthChecks = state.browserServerCalls.filter(c => c.path === "/health");
+    expect(healthChecks.length).toBeGreaterThanOrEqual(1);
+  });
+
   it("creates the sandbox with a private-range denylist instead of the old blanket allowInternetAccess flag", async () => {
-    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : successfulNavigate());
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = navigateResponder();
     const adapter = new E2BCloudSandboxAdapter();
 
     await adapter.execute(baseRequest({ taskId: "task-2" }));
@@ -176,8 +224,21 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(obs.output).toContain("libnss3");
   });
 
-  it("only installs the browser runtime once per task across multiple navigate calls", async () => {
-    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : successfulNavigate());
+  it("times out with a diagnosable message if the server never reports healthy", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = path => (path === "/health" ? { ok: false } : { ok: true });
+    state.fileReadResponder = path => (path.endsWith(".log") ? new TextEncoder().encode("Error: listen EADDRINUSE") : new Uint8Array());
+
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(baseRequest({ taskId: "task-5b" }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("did not become ready");
+  }, 20_000);
+
+  it("only installs the browser runtime and starts the server once per task across multiple navigate calls", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = navigateResponder();
     const adapter = new E2BCloudSandboxAdapter();
 
     await adapter.execute(baseRequest({ taskId: "task-6" }));
@@ -185,13 +246,19 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
 
     const installCalls = state.commandCalls.filter(c => c.command.includes("playwright install"));
     expect(installCalls).toHaveLength(1);
+    const serverStarts = state.commandCalls.filter(c => c.command.includes("aegis_browser_server.js") && c.command.startsWith("node"));
+    expect(serverStarts).toHaveLength(1);
   });
 
-  it("reports a page navigation error as failed and skips the screenshot upload", async () => {
-    state.commandResponder = command =>
-      command.includes("playwright install")
-        ? successfulInstall()
-        : successfulNavigate({ finalUrl: "https://unreachable.example/", title: "", status: null, textExcerpt: "", navigationError: "net::ERR_NAME_NOT_RESOLVED" });
+  it("reports a page navigation error as failed and skips the screenshot capture entirely", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = navigateResponder({
+      finalUrl: "https://unreachable.example/",
+      title: "",
+      status: null,
+      textExcerpt: "",
+      navigationError: "net::ERR_NAME_NOT_RESOLVED",
+    });
 
     const adapter = new E2BCloudSandboxAdapter();
     const obs = await adapter.execute(baseRequest({ taskId: "task-7", arguments: { url: "https://unreachable.example" } }));
@@ -199,15 +266,7 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(obs.outcome).toBe("failed");
     expect(obs.output).toContain("ERR_NAME_NOT_RESOLVED");
     expect(state.storagePutCalls).toHaveLength(0);
-  });
-
-  it("keeps browser.interact blocked, with a diagnostic pointing at the real schema gap", async () => {
-    const adapter = new E2BCloudSandboxAdapter();
-    const obs = await adapter.execute(baseRequest({ taskId: "task-8", capability: "browser.interact" }));
-
-    expect(obs.outcome).toBe("failed");
-    expect(obs.output).toContain("CapabilityArguments");
-    expect(obs.output).toContain("selector");
+    expect(state.browserServerCalls.some(c => c.path === "/screenshot")).toBe(false);
   });
 
   it("leaves shell.exec behavior unchanged (regression check)", async () => {
@@ -220,32 +279,44 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(obs.output).toBe("hello");
   });
 
-  it("never interpolates the raw URL into the shell command it runs", async () => {
-    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : successfulNavigate());
+  it("never puts the url anywhere in the shell command string it runs, not even encoded", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = navigateResponder();
     const adapter = new E2BCloudSandboxAdapter();
     const trickyUrl = 'https://example.com/?q=$(rm -rf /)"; touch pwned';
 
     await adapter.execute(baseRequest({ taskId: "task-10", arguments: { url: trickyUrl } }));
 
-    const navCommand = state.commandCalls.find(c => c.command.startsWith("node "));
-    expect(navCommand).toBeTruthy();
-    expect(navCommand!.command).not.toContain("rm -rf");
+    const clientCommands = state.commandCalls.filter(c => c.command.includes("aegis_browser_client"));
+    expect(clientCommands.length).toBeGreaterThan(0);
+    for (const c of clientCommands) {
+      expect(c.command).not.toContain("rm -rf");
+      expect(c.command).not.toContain("example.com");
+    }
 
-    const argsWrite = state.fileWrites.find(w => w.path.endsWith(".args.json"));
-    expect(argsWrite).toBeTruthy();
+    const navigateArgsWrite = [...state.fileWrites].reverse().find(w => {
+      try {
+        return JSON.parse(w.data).path === "/navigate";
+      } catch {
+        return false;
+      }
+    });
+    expect(navigateArgsWrite).toBeTruthy();
     // The URL constructor percent-encodes spaces/quotes on the way in, so
-    // the dangerous substring survives only in encoded form -- that's the
-    // correct, extra-safe outcome.
-    expect(JSON.parse(argsWrite!.data).url).toContain("rm%20-rf");
+    // the dangerous substring survives only in encoded form in the args
+    // file -- never in a command string, and it's the correct, extra-safe
+    // outcome either way.
+    const navigateBody = JSON.parse(navigateArgsWrite!.data).body as { url: string };
+    expect(navigateBody.url).toContain("rm%20-rf");
   });
 
   it("returns a failed observation instead of throwing when sandbox creation itself fails", async () => {
-    // Regression check for a real pre-existing bug found while fixing this
-    // test's own missing E2B_API_KEY stub: sandboxFor() used to be called
-    // outside execute()'s try/catch, so any failure here (bad credential,
-    // an E2B API error, anything) propagated as an uncaught throw instead
-    // of a clean failed observation -- and nothing upstream
-    // (CapabilityBroker.dispatch, AgentLoop's run loop) catches it either.
+    // Regression check for a real pre-existing bug found in an earlier
+    // round: sandboxFor() used to be called outside execute()'s try/catch,
+    // so any failure here (bad credential, an E2B API error, anything)
+    // propagated as an uncaught throw instead of a clean failed
+    // observation -- and nothing upstream (CapabilityBroker.dispatch,
+    // AgentLoop's run loop) catches it either.
     vi.stubEnv("E2B_API_KEY", "");
     const adapter = new E2BCloudSandboxAdapter();
 
@@ -254,6 +325,112 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(obs.outcome).toBe("failed");
     expect(obs.output).toContain("E2B_API_KEY is not configured");
     expect(state.sandboxCreateOpts).toHaveLength(0);
+  });
+});
+
+describe("E2BCloudSandboxAdapter browser.interact", () => {
+  function interactRequest(overrides: Partial<CapabilityRequest> = {}): CapabilityRequest {
+    return baseRequest({
+      capability: "browser.interact",
+      arguments: { selector: "#submit", interaction: "click" },
+      ...overrides,
+    });
+  }
+
+  it("performs the interaction against the already-open page and returns evidence with a screenshot", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = path => {
+      if (path === "/interact") return { ok: true, finalUrl: "https://example.com/thanks", title: "Thanks" };
+      if (path === "/screenshot") return { screenshotBase64: Buffer.from([1, 2, 3, 4]).toString("base64") };
+      return { ok: true };
+    };
+
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(interactRequest({ taskId: "task-28" }));
+
+    expect(obs.outcome).toBe("completed");
+    expect(obs.output).toContain('Performed "click" on "#submit"');
+    expect(obs.output).toContain("https://example.com/thanks");
+    expect(obs.evidence).toContain("interaction:click");
+    expect(obs.evidence).toContain("selector:#submit");
+    expect(obs.evidence.some(e => e.startsWith("screenshot:"))).toBe(true);
+    expect(state.storagePutCalls).toHaveLength(1);
+  });
+
+  it("shares the same browser runtime install/server-startup caching as browser.navigate on the same task", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = path => {
+      if (path === "/navigate") return { finalUrl: "https://example.com/", title: "Example", status: 200, textExcerpt: "", navigationError: null };
+      if (path === "/interact") return { ok: true, finalUrl: "https://example.com/", title: "Example" };
+      if (path === "/screenshot") return { screenshotBase64: Buffer.from([1]).toString("base64") };
+      return { ok: true };
+    };
+    const adapter = new E2BCloudSandboxAdapter();
+
+    await adapter.execute(baseRequest({ taskId: "task-29", capability: "browser.navigate", arguments: { url: "https://example.com" } }));
+    await adapter.execute(interactRequest({ taskId: "task-29" }));
+
+    const installCalls = state.commandCalls.filter(c => c.command.includes("playwright install"));
+    expect(installCalls).toHaveLength(1);
+    const serverStarts = state.commandCalls.filter(c => c.command.includes("aegis_browser_server.js") && c.command.startsWith("node"));
+    expect(serverStarts).toHaveLength(1);
+  });
+
+  it("fails cleanly when selector is missing", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(interactRequest({ taskId: "task-30", arguments: { interaction: "click" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("selector is required");
+    expect(state.commandCalls).toHaveLength(0);
+  });
+
+  it("fails cleanly when interaction is missing", async () => {
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(interactRequest({ taskId: "task-31", arguments: { selector: "#submit" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("interaction is required");
+    expect(state.commandCalls).toHaveLength(0);
+  });
+
+  it("passes the value through for a type interaction", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = path => {
+      if (path === "/interact") return { ok: true, finalUrl: "https://example.com/", title: "Example" };
+      if (path === "/screenshot") return { screenshotBase64: Buffer.from([1]).toString("base64") };
+      return { ok: true };
+    };
+    const adapter = new E2BCloudSandboxAdapter();
+
+    await adapter.execute(interactRequest({ taskId: "task-32", arguments: { selector: "#email", interaction: "type", value: "user@example.com" } }));
+
+    const interactCall = state.browserServerCalls.find(c => c.path === "/interact");
+    expect(interactCall).toBeTruthy();
+    expect((interactCall!.body as { value?: string }).value).toBe("user@example.com");
+  });
+
+  it("surfaces the in-sandbox interaction error as a failed observation (e.g. selector not found)", async () => {
+    state.commandResponder = command => (command.includes("playwright install") ? successfulInstall() : { stdout: "", stderr: "", exitCode: 0 });
+    state.browserServerResponder = path => (path === "/interact" ? { ok: false, error: "Timeout 10000ms exceeded waiting for selector \"#missing\"" } : { ok: true });
+
+    const adapter = new E2BCloudSandboxAdapter();
+    const obs = await adapter.execute(interactRequest({ taskId: "task-33", arguments: { selector: "#missing", interaction: "click" } }));
+
+    expect(obs.outcome).toBe("failed");
+    expect(obs.output).toContain("#missing");
+    expect(state.storagePutCalls).toHaveLength(0);
+  });
+
+  it("requires approval by policy (approvalSensitive), unlike browser.navigate", async () => {
+    // Not exercised through the adapter (policy enforcement happens in
+    // policy.ts/the router, upstream of the adapter) -- this just pins
+    // down the registry fact the rest of this capability's safety
+    // argument depends on, so a future change to registry.ts that
+    // silently drops this flag gets caught here too.
+    const { capabilityRegistry } = await import("./registry");
+    const entry = capabilityRegistry.find(c => c.name === "browser.interact");
+    expect(entry?.approvalSensitive).toBe(true);
   });
 });
 

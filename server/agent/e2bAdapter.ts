@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { Sandbox } from "e2b";
-import { nanoid } from "nanoid";
 import { storagePut } from "../storage";
 import { callDataApi } from "../_core/dataApi";
 import type { CapabilityObservation, CapabilityRequest, ExecutionAdapter } from "./execution";
@@ -262,48 +261,145 @@ async function queryForgeSearch(query: string): Promise<{ output: string; eviden
   };
 }
 
-// Runs inside the sandbox via `node <script> <argsFile>`. Arguments are read
-// from a JSON file rather than argv/env so a URL containing quotes or shell
-// metacharacters can never be interpreted by the shell that invokes it.
-const NAVIGATE_SCRIPT = `
-const fs = require("fs");
+// -----------------------------------------------------------------------
+// browser.navigate / browser.interact
+//
+// Both share ONE persistent browser session per task, not a fresh
+// browser per call. That's a deliberate change from the first
+// browser.navigate delivery (which launched and closed a browser inside
+// a single one-shot script per call): a real interaction flow -- navigate
+// to a page, fill a field, click submit -- needs the page to still be
+// open and in the same state for step 2 as it was at the end of step 1.
+// A stateless per-call browser would silently lose everything between
+// calls, making browser.interact useless for anything but a single
+// isolated action against a fresh page.
+//
+// The session lives as a small persistent HTTP server, started as an
+// E2B background process (`commands.run(..., { background: true })`,
+// confirmed against current docs.e2b.dev -- returns immediately, keeps
+// running after the SDK call returns, killed automatically when the
+// sandbox itself is killed). It owns one Playwright browser + page
+// instance for the lifetime of the sandbox. Each navigate/interact call
+// from the adapter is a lightweight HTTP request from a short-lived
+// script to that already-running server on 127.0.0.1 -- not a new
+// browser launch.
+const BROWSER_SERVER_PORT = 39217;
+const BROWSER_SERVER_SCRIPT_PATH = "/tmp/aegis_browser_server.js";
+const BROWSER_CLIENT_SCRIPT_PATH = "/tmp/aegis_browser_client.js";
+const BROWSER_SERVER_STARTUP_TIMEOUT_MS = 15_000;
+const BROWSER_SERVER_STARTUP_POLL_MS = 500;
+
+const BROWSER_SERVER_SCRIPT = `
+const http = require("http");
 const { chromium } = require("playwright");
 
-async function main() {
-  const args = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-  const browser = await chromium.launch();
-  try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-    let response = null;
-    let navigationError = null;
-    try {
-      response = await page.goto(args.url, { waitUntil: "networkidle", timeout: args.timeoutMs });
-    } catch (err) {
-      navigationError = err instanceof Error ? err.message : String(err);
-    }
-    const title = await page.title().catch(() => "");
-    const finalUrl = page.url();
-    const textExcerpt = await page
-      .evaluate(() => (document.body ? document.body.innerText : ""))
-      .catch(() => "");
-    await page.screenshot({ path: args.screenshotPath }).catch(() => {});
-    process.stdout.write(JSON.stringify({
-      finalUrl,
-      title,
-      status: response ? response.status() : null,
-      textExcerpt: textExcerpt.slice(0, 2000),
-      navigationError,
-    }));
-  } finally {
-    await browser.close();
-  }
+let browserPromise = null;
+let pagePromise = null;
+
+async function getPage() {
+  if (!browserPromise) browserPromise = chromium.launch();
+  const browser = await browserPromise;
+  if (!pagePromise) pagePromise = browser.newPage({ viewport: { width: 1280, height: 800 } });
+  return pagePromise;
 }
 
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", chunk => (data += chunk));
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+function send(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true });
+
+    if (req.method === "POST" && req.url === "/navigate") {
+      const { url, timeoutMs } = JSON.parse(await readBody(req));
+      const page = await getPage();
+      let response = null;
+      let navigationError = null;
+      try {
+        response = await page.goto(url, { waitUntil: "networkidle", timeout: timeoutMs || 30000 });
+      } catch (err) {
+        navigationError = err instanceof Error ? err.message : String(err);
+      }
+      const title = await page.title().catch(() => "");
+      const textExcerpt = await page.evaluate(() => (document.body ? document.body.innerText : "")).catch(() => "");
+      return send(res, 200, {
+        finalUrl: page.url(),
+        title,
+        status: response ? response.status() : null,
+        textExcerpt: textExcerpt.slice(0, 2000),
+        navigationError,
+      });
+    }
+
+    if (req.method === "POST" && req.url === "/interact") {
+      const { action, selector, value, timeoutMs } = JSON.parse(await readBody(req));
+      const page = await getPage();
+      const effectiveTimeout = timeoutMs || 10000;
+      try {
+        const locator = page.locator(selector).first();
+        if (action === "click") await locator.click({ timeout: effectiveTimeout });
+        else if (action === "type") await locator.fill(value !== undefined ? value : "", { timeout: effectiveTimeout });
+        else if (action === "select") await locator.selectOption(value !== undefined ? value : "", { timeout: effectiveTimeout });
+        else if (action === "check") await locator.check({ timeout: effectiveTimeout });
+        else if (action === "uncheck") await locator.uncheck({ timeout: effectiveTimeout });
+        else if (action === "hover") await locator.hover({ timeout: effectiveTimeout });
+        else return send(res, 200, { ok: false, error: "Unsupported interaction \\"" + action + "\\". Use click, type, select, check, uncheck, or hover." });
+
+        const title = await page.title().catch(() => "");
+        return send(res, 200, { ok: true, finalUrl: page.url(), title });
+      } catch (err) {
+        return send(res, 200, { ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    if (req.method === "GET" && req.url === "/screenshot") {
+      const page = await getPage();
+      const buffer = await page.screenshot();
+      return send(res, 200, { screenshotBase64: buffer.toString("base64") });
+    }
+
+    send(res, 404, { error: "not found" });
+  } catch (err) {
+    send(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+server.listen(${BROWSER_SERVER_PORT}, "127.0.0.1");
+`;
+
+// Tiny, reusable client: reads {method, path, body} from an args file
+// (never argv -- same shell-injection reasoning as buildHttpRequestScript
+// above) and relays it to the already-running server on localhost.
+const BROWSER_CLIENT_SCRIPT = `
+const fs = require("fs");
+async function main() {
+  const args = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  const res = await fetch("http://127.0.0.1:${BROWSER_SERVER_PORT}" + args.path, {
+    method: args.method,
+    headers: { "content-type": "application/json" },
+    body: args.body !== undefined ? JSON.stringify(args.body) : undefined,
+  });
+  const json = await res.json();
+  process.stdout.write(JSON.stringify(json));
+}
 main().catch(err => {
-  process.stderr.write(err instanceof Error ? err.message : String(err));
+  process.stdout.write(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
   process.exit(1);
 });
 `;
+
+type BrowserServerRequest = { method: "GET" | "POST"; path: string; body?: unknown };
 
 type NavigateResult = {
   finalUrl: string;
@@ -312,6 +408,8 @@ type NavigateResult = {
   textExcerpt: string;
   navigationError: string | null;
 };
+
+type InteractResult = { ok: boolean; finalUrl?: string; title?: string; error?: string };
 
 export class E2BCloudSandboxAdapter implements ExecutionAdapter {
   readonly id = "e2b-cloud-sandbox";
@@ -339,61 +437,106 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
     return sandbox;
   }
 
-  // Installs Playwright + a Chromium binary the first time a task calls
-  // browser.navigate. This is a real, potentially slow (60-180s) network
-  // operation on cold start; cached per taskId so it happens at most once
-  // per sandbox lifetime. See INSTRUCTIONS.md for the operational
-  // assumptions this makes about the sandbox's base image.
+  // Installs Playwright + a Chromium binary, then starts the persistent
+  // browser server, the first time a task calls browser.navigate or
+  // browser.interact. Both steps are real, potentially slow (installing
+  // can take 60-180s on cold start) network/process operations; cached
+  // per taskId so they happen at most once per sandbox lifetime. See
+  // INSTRUCTIONS.md for the operational assumptions this makes about the
+  // sandbox's base image. The server is a background process
+  // (commands.run(..., { background: true })) -- it keeps running after
+  // this call returns, and is killed automatically when the sandbox
+  // itself is killed (see cancel()); no separate process handle needs to
+  // be tracked for cleanup.
   private async ensureBrowserRuntime(sandbox: Sandbox, taskId: string) {
     if (this.browserRuntimeReady.has(taskId)) return;
-    const result = await sandbox.commands.run(
+
+    const installResult = await sandbox.commands.run(
       "npm install --no-save --no-audit --no-fund playwright && npx --yes playwright install --with-deps chromium",
       { timeoutMs: BROWSER_INSTALL_TIMEOUT_MS }
     );
-    if (result.exitCode !== 0) {
+    if (installResult.exitCode !== 0) {
       throw new Error(
-        `Could not install the browser runtime in the sandbox: ${commandOutput(result) || `exit code ${result.exitCode}`}`
+        `Could not install the browser runtime in the sandbox: ${commandOutput(installResult) || `exit code ${installResult.exitCode}`}`
       );
     }
+
+    await sandbox.files.write(BROWSER_SERVER_SCRIPT_PATH, BROWSER_SERVER_SCRIPT);
+    await sandbox.files.write(BROWSER_CLIENT_SCRIPT_PATH, BROWSER_CLIENT_SCRIPT);
+    await sandbox.commands.run(`node ${BROWSER_SERVER_SCRIPT_PATH} > /tmp/aegis_browser_server.log 2>&1`, {
+      background: true,
+      timeoutMs: 0,
+    });
+
+    const deadline = Date.now() + BROWSER_SERVER_STARTUP_TIMEOUT_MS;
+    let healthy = false;
+    let lastError = "";
+    while (Date.now() < deadline) {
+      try {
+        const health = await this.callBrowserServer(sandbox, { method: "GET", path: "/health" });
+        if ((health as { ok?: boolean }).ok) {
+          healthy = true;
+          break;
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      await new Promise(resolve => setTimeout(resolve, BROWSER_SERVER_STARTUP_POLL_MS));
+    }
+    if (!healthy) {
+      const log = await sandbox.files.read("/tmp/aegis_browser_server.log").catch(() => "");
+      throw new Error(
+        `The browser server did not become ready within ${BROWSER_SERVER_STARTUP_TIMEOUT_MS}ms.${lastError ? ` Last error: ${lastError}.` : ""}${log ? ` Server log: ${log}` : ""}`
+      );
+    }
+
     this.browserRuntimeReady.add(taskId);
+  }
+
+  private async callBrowserServer(sandbox: Sandbox, request: BrowserServerRequest): Promise<unknown> {
+    const argsPath = `/tmp/aegis_browser_client_${randomUUID()}.args.json`;
+    await sandbox.files.write(argsPath, JSON.stringify(request));
+    const result = await sandbox.commands.run(`node ${BROWSER_CLIENT_SCRIPT_PATH} ${argsPath}`, {
+      timeoutMs: BROWSER_NAVIGATE_TIMEOUT_MS,
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(`Browser server request failed: ${commandOutput(result) || `exit code ${result.exitCode}`}`);
+    }
+    try {
+      return JSON.parse(result.stdout.trim());
+    } catch {
+      throw new Error(`Browser server returned an unparsable response: ${result.stdout.slice(0, 500)}`);
+    }
+  }
+
+  private async captureScreenshotEvidence(sandbox: Sandbox, taskId: string): Promise<string> {
+    const shot = (await this.callBrowserServer(sandbox, { method: "GET", path: "/screenshot" })) as {
+      screenshotBase64?: string;
+      error?: string;
+    };
+    if (!shot.screenshotBase64) {
+      throw new Error(shot.error || "The browser server did not return a screenshot.");
+    }
+    const screenshotKey = `agent-computer/${taskId}/browser-evidence/${randomUUID()}.png`;
+    const { url } = await storagePut(screenshotKey, Buffer.from(shot.screenshotBase64, "base64"), "image/png");
+    return url;
   }
 
   private async navigate(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: string[] }> {
     const url = assertNavigableUrl(requireString(request.arguments, "url"));
     await this.ensureBrowserRuntime(sandbox, request.taskId);
 
-    const runId = nanoid();
-    const scriptPath = `/tmp/aegis_navigate_${runId}.js`;
-    const argsPath = `/tmp/aegis_navigate_${runId}.args.json`;
-    const screenshotPath = `/tmp/aegis_navigate_${runId}.png`;
-
-    await sandbox.files.write(scriptPath, NAVIGATE_SCRIPT);
-    await sandbox.files.write(
-      argsPath,
-      JSON.stringify({ url: url.toString(), screenshotPath, timeoutMs: BROWSER_PAGE_TIMEOUT_MS })
-    );
-
-    const result = await sandbox.commands.run(`node ${scriptPath} ${argsPath}`, {
-      timeoutMs: BROWSER_NAVIGATE_TIMEOUT_MS,
-    });
-    if (result.exitCode !== 0) {
-      throw new Error(`Browser navigation failed: ${commandOutput(result) || `exit code ${result.exitCode}`}`);
-    }
-
-    let parsed: NavigateResult;
-    try {
-      parsed = JSON.parse(result.stdout.trim());
-    } catch {
-      throw new Error(`Browser navigation returned an unexpected result: ${result.stdout.slice(0, 500)}`);
-    }
+    const parsed = (await this.callBrowserServer(sandbox, {
+      method: "POST",
+      path: "/navigate",
+      body: { url: url.toString(), timeoutMs: BROWSER_PAGE_TIMEOUT_MS },
+    })) as NavigateResult;
 
     if (parsed.navigationError) {
       throw new Error(`Navigation to ${url.toString()} did not complete: ${parsed.navigationError}`);
     }
 
-    const screenshotBytes = await sandbox.files.read(screenshotPath, { format: "bytes" });
-    const screenshotKey = `agent-computer/${request.taskId}/browser-evidence/${runId}.png`;
-    const { url: screenshotUrl } = await storagePut(screenshotKey, screenshotBytes, "image/png");
+    const screenshotUrl = await this.captureScreenshotEvidence(sandbox, request.taskId);
 
     const output = [
       `Navigated to ${parsed.finalUrl} (status ${parsed.status ?? "unknown"}).`,
@@ -406,6 +549,35 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
     return {
       output,
       evidence: [`final_url:${parsed.finalUrl}`, `http_status:${parsed.status ?? "unknown"}`, `screenshot:${screenshotUrl}`],
+    };
+  }
+
+  private async interact(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: string[] }> {
+    const selector = requireString(request.arguments, "selector");
+    const action = requireString(request.arguments, "interaction").toLowerCase();
+    const value = typeof request.arguments.value === "string" ? request.arguments.value : undefined;
+    await this.ensureBrowserRuntime(sandbox, request.taskId);
+
+    const result = (await this.callBrowserServer(sandbox, {
+      method: "POST",
+      path: "/interact",
+      body: { action, selector, value, timeoutMs: BROWSER_PAGE_TIMEOUT_MS },
+    })) as InteractResult;
+
+    if (!result.ok) {
+      throw new Error(result.error || `The "${action}" interaction on "${selector}" failed for an unknown reason.`);
+    }
+
+    const screenshotUrl = await this.captureScreenshotEvidence(sandbox, request.taskId);
+
+    const output = [
+      `Performed "${action}" on "${selector}".`,
+      `Page is now at ${result.finalUrl} (${result.title || "no title"}).`,
+    ].join("\n");
+
+    return {
+      output,
+      evidence: [`interaction:${action}`, `selector:${selector}`, `final_url:${result.finalUrl}`, `screenshot:${screenshotUrl}`],
     };
   }
 
@@ -459,6 +631,12 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
           const navResult = await this.navigate(sandbox, request);
           output = navResult.output;
           evidence = [...evidence, ...navResult.evidence];
+          break;
+        }
+        case "browser.interact": {
+          const interactResult = await this.interact(sandbox, request);
+          output = interactResult.output;
+          evidence = [...evidence, ...interactResult.evidence];
           break;
         }
         case "http.request": {
@@ -532,10 +710,6 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
         case "artifact.pack":
         case "secret.inject":
           throw new Error(`${request.capability} is not yet implemented by the E2B adapter.`);
-        case "browser.interact":
-          throw new Error(
-            "browser.interact is not implemented: CapabilityArguments (server/agent/modelGateway.ts) has no field for a target selector, interaction type, or value -- only command/path/content/url/notes, and the structured-output schema forbids extra fields. Extend that schema and the selectCapabilityArguments prompt before wiring this case."
-          );
         default:
           throw new Error(`Unsupported capability ${request.capability}.`);
       }
