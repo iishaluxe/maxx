@@ -8,7 +8,7 @@ import {
   updateTaskUsage,
 } from "../db";
 import { alertOwner } from "./ownerAlerts";
-import { CapabilityBroker, type CapabilityRequest } from "./execution";
+import { CapabilityBroker, formatEvidenceItem, type CapabilityRequest } from "./execution";
 import { assessBudget } from "./policy";
 import {
   decideRecovery,
@@ -192,7 +192,7 @@ export async function runAgentTask(
 
       // outcome === "completed"
       await updatePlanStepStatus({ id: step.id, taskId: task.id, status: "complete" });
-      evidenceLog.push(...observation.evidence, observation.output);
+      evidenceLog.push(...observation.evidence.map(formatEvidenceItem), observation.output);
 
       try {
         const interpretation = await interpretObservation({

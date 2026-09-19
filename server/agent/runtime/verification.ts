@@ -1,4 +1,4 @@
-import type { CapabilityObservation } from "../execution";
+import { formatEvidenceItem, type CapabilityObservation } from "../execution";
 
 export type VerificationRequirement = {
   requiredOutcome?: CapabilityObservation["outcome"];
@@ -26,8 +26,9 @@ export function verifyObservation(
     );
   }
 
+  const formattedEvidence = observation.evidence.map(formatEvidenceItem);
   for (const evidence of requirement.requiredEvidence ?? []) {
-    if (!observation.evidence.includes(evidence)) {
+    if (!formattedEvidence.includes(evidence)) {
       reasons.push(`Missing required evidence: ${evidence}.`);
     }
   }

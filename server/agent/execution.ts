@@ -15,14 +15,30 @@ export type CapabilityRequest = {
   approvalGranted?: boolean;
 };
 
+// A stable machine key (kind), the actual value, and an optional
+// human-readable label for display/LLM-prompt rendering when `kind` alone
+// isn't self-explanatory. Replaces the old ad-hoc "key:value" evidence
+// strings -- those were ambiguous to parse back apart whenever a value
+// (e.g. a URL) contained its own colon.
+export type EvidenceItem = { kind: string; value: string; label?: string };
+
 export type CapabilityObservation = {
   outcome: "completed" | "failed" | "connection_required" | "cancelled";
   output: string;
-  evidence: string[];
+  evidence: EvidenceItem[];
   adapterId: string;
   startedAt: Date;
   completedAt: Date;
 };
+
+// Renders a single EvidenceItem back into the old "key:value" string shape,
+// for the handful of call sites that still need a flat string log (the
+// task-level evidence log in taskRunner.ts/durableTaskRunner.ts, and
+// verification.ts's exact-string comparison) -- preserves the exact
+// previous text so downstream LLM prompts see no change.
+export function formatEvidenceItem(item: EvidenceItem): string {
+  return `${item.label ?? item.kind}:${item.value}`;
+}
 
 export interface ExecutionAdapter {
   id: string;
@@ -86,7 +102,7 @@ export class CapabilityBroker {
         observation: {
           outcome: "connection_required",
           output: "No eligible execution adapter is connected for this target.",
-          evidence: ["adapter:unconfigured"],
+          evidence: [{ kind: "adapter", value: "unconfigured" }],
           adapterId: adapter?.id ?? "unconfigured",
           startedAt: now,
           completedAt: now,
@@ -112,7 +128,7 @@ export class UnconfiguredExecutionAdapter implements ExecutionAdapter {
     return {
       outcome: "connection_required",
       output: `The ${this.target} adapter is not connected, so ${request.capability} was not executed.`,
-      evidence: ["adapter:unconfigured"],
+      evidence: [{ kind: "adapter", value: "unconfigured" }],
       adapterId: this.id,
       startedAt: now,
       completedAt: now,

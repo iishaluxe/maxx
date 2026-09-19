@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { CapabilityBroker } from "../execution";
+import { CapabilityBroker, type EvidenceItem } from "../execution";
 import { DurableAgentRuntime } from "./durableRuntime";
 import { RuntimeExecutor } from "./executor";
 import { AgentLoop } from "./agentLoop";
@@ -27,7 +27,7 @@ function setup(observation: unknown) {
   return { runtime, executor: new RuntimeExecutor(broker, runtime) };
 }
 
-const completed = (output: string, evidence: string[]) => ({
+const completed = (output: string, evidence: EvidenceItem[]) => ({
   outcome: "completed" as const,
   output,
   evidence,
@@ -49,7 +49,7 @@ describe("AgentLoop", () => {
   });
 
   it("executes and verifies a successful plan", async () => {
-    const { runtime, executor } = setup(completed("created", ["file:created"]));
+    const { runtime, executor } = setup(completed("created", [{ kind: "file", value: "created" }]));
     const loop = new AgentLoop(runtime, executor, {
       planner: vi.fn().mockResolvedValue({
         request,
@@ -91,7 +91,7 @@ describe("AgentLoop", () => {
         kind: "observation",
         observation: completed(
           ++calls === 1 ? "wrong" : "correct",
-          calls === 1 ? [] : ["fixed"],
+          calls === 1 ? [] : [{ kind: "fixed", value: "true" }],
         ),
       })),
     } as unknown as CapabilityBroker;
@@ -101,12 +101,12 @@ describe("AgentLoop", () => {
     );
 
     const planner = vi.fn()
-      .mockResolvedValueOnce({ request, verification: { requiredEvidence: ["fixed"] } })
-      .mockResolvedValueOnce({ request, verification: { requiredEvidence: ["fixed"] } });
+      .mockResolvedValueOnce({ request, verification: { requiredEvidence: ["fixed:true"] } })
+      .mockResolvedValueOnce({ request, verification: { requiredEvidence: ["fixed:true"] } });
 
     const loop = new AgentLoop(runtime, new RuntimeExecutor(broker, runtime), {
       planner,
-      recovery: vi.fn().mockResolvedValue({ request, verification: { requiredEvidence: ["fixed"] } }),
+      recovery: vi.fn().mockResolvedValue({ request, verification: { requiredEvidence: ["fixed:true"] } }),
       maxCycles: 2,
     });
 

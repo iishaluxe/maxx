@@ -17,7 +17,7 @@ function makeBroker(): CapabilityBroker {
       observation: {
         outcome: "completed",
         output: "done",
-        evidence: ["verified"],
+        evidence: [{ kind: "verified", value: "true" }],
         adapterId: "test",
         startedAt: new Date(),
         completedAt: new Date(),
@@ -42,7 +42,7 @@ describe("AutonomousAgent", () => {
               arguments: { description: "List files", expectedEvidence: "verified" },
               destructive: false,
             },
-            verification: { requiredOutcome: "completed", requiredEvidence: ["verified"] },
+            verification: { requiredOutcome: "completed", requiredEvidence: ["verified:true"] },
           },
         })
         .mockResolvedValueOnce({ kind: "no_work", reason: "Nothing remains." }),

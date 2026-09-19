@@ -89,7 +89,7 @@ describe("ModelBackedPlanner", () => {
     const previousObservation: CapabilityObservation = {
       outcome: "completed",
       output: "workspace listed",
-      evidence: ["workspace:list"],
+      evidence: [{ kind: "workspace", value: "list" }],
       adapterId: "test",
       startedAt: new Date(),
       completedAt: new Date(),
