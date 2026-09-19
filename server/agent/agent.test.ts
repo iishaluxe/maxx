@@ -44,7 +44,7 @@ describe("Agent Computer policy engine", () => {
       execute: async () => {
         wasCalled = true;
         const now = new Date();
-        return { outcome: "completed", output: "ok", evidence: ["command:0"], adapterId: "test-cloud", startedAt: now, completedAt: now };
+        return { outcome: "completed", output: "ok", evidence: [{ kind: "command", value: "0" }], adapterId: "test-cloud", startedAt: now, completedAt: now };
       },
       cancel: async () => undefined,
     };
@@ -79,7 +79,7 @@ describe("Agent Computer policy engine", () => {
       execute: async () => {
         wasCalled = true;
         const now = new Date();
-        return { outcome: "completed", output: "installed", evidence: ["exit_code:0"], adapterId: "approved-test-cloud", startedAt: now, completedAt: now };
+        return { outcome: "completed", output: "installed", evidence: [{ kind: "exit_code", value: "0" }], adapterId: "approved-test-cloud", startedAt: now, completedAt: now };
       },
       cancel: async () => undefined,
     };

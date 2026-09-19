@@ -18,7 +18,7 @@ describe("CapabilityExecutionAdapter", () => {
         return { kind: "observation", observation: {
           outcome: "completed" as const,
           output: "ok",
-          evidence: ["done"],
+          evidence: [{ kind: "done", value: "" }],
           adapterId: "runtime-executor",
           startedAt: now,
           completedAt: now,

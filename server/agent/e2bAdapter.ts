@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Sandbox } from "e2b";
 import { storagePut } from "../storage";
 import { callDataApi } from "../_core/dataApi";
-import type { CapabilityObservation, CapabilityRequest, ExecutionAdapter } from "./execution";
+import type { CapabilityObservation, CapabilityRequest, EvidenceItem, ExecutionAdapter } from "./execution";
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const BROWSER_INSTALL_TIMEOUT_MS = 3 * 60 * 1000;
@@ -239,7 +239,7 @@ function normalizeSearchResults(payload: unknown): { results: NormalizedSearchRe
   return { results: [], raw: JSON.stringify(payload).slice(0, 2000) };
 }
 
-async function queryForgeSearch(query: string): Promise<{ output: string; evidence: string[] }> {
+async function queryForgeSearch(query: string): Promise<{ output: string; evidence: EvidenceItem[] }> {
   const payload = await callDataApi(FORGE_SEARCH_API_ID, { query: { q: query } });
   const normalized = normalizeSearchResults(payload);
 
@@ -247,7 +247,7 @@ async function queryForgeSearch(query: string): Promise<{ output: string; eviden
     const output = normalized.raw
       ? `No structured results could be parsed from the search response. Raw response (truncated):\n${normalized.raw}`
       : "The search returned no results.";
-    return { output, evidence: [`search_query:${query}`, `search_result_count:0`] };
+    return { output, evidence: [{ kind: "search_query", value: query }, { kind: "search_result_count", value: "0" }] };
   }
 
   const output = normalized.results
@@ -257,7 +257,7 @@ async function queryForgeSearch(query: string): Promise<{ output: string; eviden
 
   return {
     output,
-    evidence: [`search_query:${query}`, `search_result_count:${normalized.results.length}`],
+    evidence: [{ kind: "search_query", value: query }, { kind: "search_result_count", value: String(normalized.results.length) }],
   };
 }
 
@@ -522,7 +522,7 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
     return url;
   }
 
-  private async navigate(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: string[] }> {
+  private async navigate(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: EvidenceItem[] }> {
     const url = assertNavigableUrl(requireString(request.arguments, "url"));
     await this.ensureBrowserRuntime(sandbox, request.taskId);
 
@@ -548,11 +548,15 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
 
     return {
       output,
-      evidence: [`final_url:${parsed.finalUrl}`, `http_status:${parsed.status ?? "unknown"}`, `screenshot:${screenshotUrl}`],
+      evidence: [
+        { kind: "final_url", value: parsed.finalUrl },
+        { kind: "http_status", value: String(parsed.status ?? "unknown") },
+        { kind: "screenshot", value: screenshotUrl },
+      ],
     };
   }
 
-  private async interact(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: string[] }> {
+  private async interact(sandbox: Sandbox, request: CapabilityRequest): Promise<{ output: string; evidence: EvidenceItem[] }> {
     const selector = requireString(request.arguments, "selector");
     const action = requireString(request.arguments, "interaction").toLowerCase();
     const value = typeof request.arguments.value === "string" ? request.arguments.value : undefined;
@@ -577,7 +581,12 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
 
     return {
       output,
-      evidence: [`interaction:${action}`, `selector:${selector}`, `final_url:${result.finalUrl}`, `screenshot:${screenshotUrl}`],
+      evidence: [
+        { kind: "interaction", value: action },
+        { kind: "selector", value: selector },
+        { kind: "final_url", value: String(result.finalUrl) },
+        { kind: "screenshot", value: screenshotUrl },
+      ],
     };
   }
 
@@ -588,7 +597,7 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
     try {
       sandbox = await this.sandboxFor(request.taskId);
       let output = "";
-      let evidence: string[] = [`sandbox:${sandbox.sandboxId}`];
+      let evidence: EvidenceItem[] = [{ kind: "sandbox", value: sandbox.sandboxId }];
       switch (request.capability) {
         case "shell.exec":
         case "process.start":
@@ -597,7 +606,7 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
           const command = requireString(request.arguments, "command");
           const result = await sandbox.commands.run(command, { timeoutMs: 120_000 });
           output = commandOutput(result);
-          evidence = [...evidence, `exit_code:${result.exitCode}`];
+          evidence = [...evidence, { kind: "exit_code", value: String(result.exitCode) }];
           return {
             outcome: result.exitCode === 0 ? "completed" : "failed",
             output: output || `Command finished with exit code ${result.exitCode}.`,
@@ -610,7 +619,7 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
         case "filesystem.read": {
           const path = requireString(request.arguments, "path");
           output = await sandbox.files.read(path);
-          evidence = [...evidence, `file_read:${path}`];
+          evidence = [...evidence, { kind: "file_read", value: path }];
           break;
         }
         case "filesystem.write": {
@@ -618,13 +627,13 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
           const content = requireString(request.arguments, "content");
           await sandbox.files.write(path, content);
           output = `Wrote ${content.length} bytes to ${path}.`;
-          evidence = [...evidence, `file_written:${path}`];
+          evidence = [...evidence, { kind: "file_written", value: path }];
           break;
         }
         case "filesystem.list": {
           const path = typeof request.arguments.path === "string" ? request.arguments.path : "/";
           output = JSON.stringify(await sandbox.files.list(path));
-          evidence = [...evidence, `directory_listed:${path}`];
+          evidence = [...evidence, { kind: "directory_listed", value: path }];
           break;
         }
         case "browser.navigate": {
@@ -667,7 +676,7 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
             parsed = null;
           }
 
-          evidence = [...evidence, `http_url:${url}`, `http_method:${method}`];
+          evidence = [...evidence, { kind: "http_url", value: url }, { kind: "http_method", value: method }];
           if (!parsed || parsed.error) {
             return {
               outcome: "failed",
@@ -679,8 +688,8 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
             };
           }
 
-          evidence = [...evidence, `http_status:${parsed.status}`];
-          if (parsed.location) evidence = [...evidence, `http_redirect_location:${parsed.location}`];
+          evidence = [...evidence, { kind: "http_status", value: String(parsed.status) }];
+          if (parsed.location) evidence = [...evidence, { kind: "http_redirect_location", value: parsed.location }];
 
           const summaryLines = [
             `HTTP ${parsed.status} (${parsed.contentType || "unknown content type"})`,
@@ -724,7 +733,9 @@ export class E2BCloudSandboxAdapter implements ExecutionAdapter {
       return {
         outcome: "failed",
         output: error instanceof Error ? error.message : "The sandbox adapter returned an unknown error.",
-        evidence: sandbox ? [`sandbox:${sandbox.sandboxId}`, "adapter_error"] : ["adapter_error"],
+        evidence: sandbox
+          ? [{ kind: "sandbox", value: sandbox.sandboxId }, { kind: "adapter_error", value: "" }]
+          : [{ kind: "adapter_error", value: "" }],
         adapterId: this.id,
         startedAt,
         completedAt: new Date(),

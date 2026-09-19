@@ -4,7 +4,7 @@ import { verifyObservation } from "./verification";
 const observation = {
   outcome: "completed" as const,
   output: "file created successfully",
-  evidence: ["exit:0", "file:created"],
+  evidence: [{ kind: "exit", value: "0" }, { kind: "file", value: "created" }],
   adapterId: "test",
   startedAt: new Date(),
   completedAt: new Date(),

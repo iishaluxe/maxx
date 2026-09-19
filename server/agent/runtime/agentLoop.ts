@@ -1,4 +1,4 @@
-import type { CapabilityObservation, CapabilityRequest } from "../execution";
+import { formatEvidenceItem, type CapabilityObservation, type CapabilityRequest } from "../execution";
 import { DurableAgentRuntime } from "./durableRuntime";
 import { RuntimeExecutor } from "./executor";
 import { verifyObservation, type VerificationRequirement } from "./verification";
@@ -178,7 +178,7 @@ export class AgentLoop {
       );
 
       if (verification.passed) {
-        this.runtime.verificationPassed(execution.observation.evidence);
+        this.runtime.verificationPassed(execution.observation.evidence.map(formatEvidenceItem));
         await this.runtime.persistLatestEvent();
 
         if (cycles < maxCycles) {

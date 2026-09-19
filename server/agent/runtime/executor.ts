@@ -46,7 +46,7 @@ export class RuntimeExecutor {
         observation: {
           outcome: "failed",
           output: reason,
-          evidence: ["runtime:dispatch-error"],
+          evidence: [{ kind: "runtime", value: "dispatch-error" }],
           adapterId: "broker",
           startedAt: new Date(),
           completedAt: new Date(),

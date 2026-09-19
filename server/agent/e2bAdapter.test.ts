@@ -161,7 +161,7 @@ describe("E2BCloudSandboxAdapter browser.navigate", () => {
     expect(obs.outcome).toBe("completed");
     expect(obs.output).toContain("Navigated to https://example.com/");
     expect(obs.output).toContain("Example Domain");
-    expect(obs.evidence.some(e => e.startsWith("screenshot:/manus-storage/agent-computer/task-1/browser-evidence/"))).toBe(true);
+    expect(obs.evidence.some(e => e.kind === "screenshot" && e.value.startsWith("/manus-storage/agent-computer/task-1/browser-evidence/"))).toBe(true);
     expect(state.storagePutCalls).toHaveLength(1);
     expect(state.storagePutCalls[0].contentType).toBe("image/png");
   });
@@ -351,9 +351,9 @@ describe("E2BCloudSandboxAdapter browser.interact", () => {
     expect(obs.outcome).toBe("completed");
     expect(obs.output).toContain('Performed "click" on "#submit"');
     expect(obs.output).toContain("https://example.com/thanks");
-    expect(obs.evidence).toContain("interaction:click");
-    expect(obs.evidence).toContain("selector:#submit");
-    expect(obs.evidence.some(e => e.startsWith("screenshot:"))).toBe(true);
+    expect(obs.evidence).toContainEqual({ kind: "interaction", value: "click" });
+    expect(obs.evidence).toContainEqual({ kind: "selector", value: "#submit" });
+    expect(obs.evidence.some(e => e.kind === "screenshot")).toBe(true);
     expect(state.storagePutCalls).toHaveLength(1);
   });
 
@@ -489,8 +489,8 @@ describe("E2BCloudSandboxAdapter http.request", () => {
     const obs = await adapter.execute(httpRequest({ taskId: "task-16", arguments: { url: "https://example.com/data" } }));
 
     expect(obs.outcome).toBe("completed");
-    expect(obs.evidence).toContain("http_status:200");
-    expect(obs.evidence).toContain("http_url:https://example.com/data");
+    expect(obs.evidence).toContainEqual({ kind: "http_status", value: "200" });
+    expect(obs.evidence).toContainEqual({ kind: "http_url", value: "https://example.com/data" });
     expect(obs.output).toContain("hello");
 
     const scriptCommand = state.commandCalls.find(c => c.command.startsWith("node "));
@@ -541,7 +541,7 @@ describe("E2BCloudSandboxAdapter http.request", () => {
     const obs = await adapter.execute(httpRequest({ taskId: "task-19", arguments: { url: "https://example.com/start" } }));
 
     expect(obs.outcome).toBe("completed");
-    expect(obs.evidence).toContain("http_redirect_location:https://example.com/next");
+    expect(obs.evidence).toContainEqual({ kind: "http_redirect_location", value: "https://example.com/next" });
     expect(obs.output).toContain("not followed automatically");
   });
 
@@ -587,8 +587,8 @@ describe("E2BCloudSandboxAdapter search.query", () => {
     const obs = await adapter.execute(searchRequest({ taskId: "task-22" }));
 
     expect(obs.outcome).toBe("completed");
-    expect(obs.evidence).toContain("search_query:aegis computer platform");
-    expect(obs.evidence).toContain("search_result_count:2");
+    expect(obs.evidence).toContainEqual({ kind: "search_query", value: "aegis computer platform" });
+    expect(obs.evidence).toContainEqual({ kind: "search_result_count", value: "2" });
     expect(obs.output).toContain("Aegis Computer");
     expect(obs.output).toContain("https://example.com/aegis/docs");
     expect(state.dataApiCalls).toHaveLength(1);
@@ -601,12 +601,12 @@ describe("E2BCloudSandboxAdapter search.query", () => {
     state.dataApiResponder = () => ({ items: [{ name: "Item title", link: "https://example.com/item" }] });
     let obs = await adapter.execute(searchRequest({ taskId: "task-23a" }));
     expect(obs.outcome).toBe("completed");
-    expect(obs.evidence).toContain("search_result_count:1");
+    expect(obs.evidence).toContainEqual({ kind: "search_result_count", value: "1" });
 
     state.dataApiResponder = () => ({ webPages: { value: [{ name: "Bing-style title", url: "https://example.com/bing" }] } });
     obs = await adapter.execute(searchRequest({ taskId: "task-23b" }));
     expect(obs.outcome).toBe("completed");
-    expect(obs.evidence).toContain("search_result_count:1");
+    expect(obs.evidence).toContainEqual({ kind: "search_result_count", value: "1" });
   });
 
   it("does not touch the sandbox's command or file APIs at all (runs on the host, not in the sandbox)", async () => {
@@ -635,7 +635,7 @@ describe("E2BCloudSandboxAdapter search.query", () => {
     const obs = await adapter.execute(searchRequest({ taskId: "task-26" }));
 
     expect(obs.outcome).toBe("completed");
-    expect(obs.evidence).toContain("search_result_count:0");
+    expect(obs.evidence).toContainEqual({ kind: "search_result_count", value: "0" });
     expect(obs.output).toContain("somethingUnexpected");
   });
 
