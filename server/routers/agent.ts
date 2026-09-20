@@ -23,7 +23,7 @@ import { alertOwner } from "../agent/ownerAlerts";
 import { CapabilityBroker, ExecutionRouter } from "../agent/execution";
 import { E2BCloudSandboxAdapter } from "../agent/e2bAdapter";
 import { getAvailableModels } from "../agent/modelGateway";
-import { assessBudget, canTransition, evaluateCapabilityPolicy, type TaskStatus } from "../agent/policy";
+import { assessBudget, canTransition, classifyRisk, evaluateCapabilityPolicy, maxRiskTier, type TaskStatus } from "../agent/policy";
 import { capabilityRegistry, executionTargets } from "../agent/registry";
 import { runDurableTask } from "../agent/runtime/durableTaskRunner";
 import { taskIntelligenceGateway } from "../agent/intelligenceRouting";
@@ -154,12 +154,18 @@ export const agentRouter = router({
     if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "Task was not found." });
     const decision = evaluateCapabilityPolicy({ capability: input.capability, target: task.executionTarget, destructive: input.risk !== "medium" });
     if (!decision.allowed) throw new TRPCError({ code: "FORBIDDEN", message: decision.reason });
-    const approvalId = await createTaskApproval({ taskId: task.id, action: input.action, rationale: input.rationale, risk: input.risk, context: { capability: input.capability, policyReason: decision.reason } });
+    // decision.risk is always "medium" or above here (requestApproval is
+    // only reachable for capabilities/contexts where requiresApproval is
+    // true), so this floors the client-supplied risk at the capability's
+    // classified tier without ever narrowing below what createTaskApproval
+    // accepts.
+    const risk = maxRiskTier(input.risk, decision.risk) as "medium" | "high" | "critical";
+    const approvalId = await createTaskApproval({ taskId: task.id, action: input.action, rationale: input.rationale, risk, context: { capability: input.capability, policyReason: decision.reason } });
     if (task.status === "queued" || task.status === "executing" || task.status === "recovering") {
       await updateTaskStatus({ taskId: task.id, ownerId: ctx.user.id, status: "waiting_approval", currentPhase: "Waiting for a sensitive-action approval" });
     }
-    await appendExecutionEvent({ taskId: task.id, kind: "approval.requested", level: "policy", title: "Approval required", content: input.rationale, metadata: { approvalId, capability: input.capability, risk: input.risk } });
-    await alertOwner({ kind: "approval", taskId: task.id, taskTitle: task.title, detail: `${input.action} requires ${input.risk}-risk approval.` });
+    await appendExecutionEvent({ taskId: task.id, kind: "approval.requested", level: "policy", title: "Approval required", content: input.rationale, metadata: { approvalId, capability: input.capability, risk } });
+    await alertOwner({ kind: "approval", taskId: task.id, taskTitle: task.title, detail: `${input.action} requires ${risk}-risk approval.` });
     return { approvalId, decision };
   }),
 
@@ -223,7 +229,13 @@ export const agentRouter = router({
       throw new TRPCError({ code: "FORBIDDEN", message: dispatch.reason });
     }
     if (dispatch.kind === "approval_required") {
-      const approvalId = await createTaskApproval({ taskId: task.id, action: input.action, rationale: dispatch.reason, risk: input.destructive ? "high" : "medium", context: { capability: input.capability, arguments: input.arguments } });
+      const approvalId = await createTaskApproval({
+        taskId: task.id,
+        action: input.action,
+        rationale: dispatch.reason,
+        risk: classifyRisk({ capability: input.capability, target: "cloud_sandbox", destructive: input.destructive }) as "medium" | "high" | "critical",
+        context: { capability: input.capability, arguments: input.arguments },
+      });
       await updateTaskStatus({ taskId: task.id, ownerId: ctx.user.id, status: "waiting_approval", currentPhase: "Waiting for an execution approval" });
       await appendExecutionEvent({ taskId: task.id, kind: "approval.requested", level: "policy", title: "Execution paused for approval", content: dispatch.reason, metadata: { approvalId, capability: input.capability } });
       await alertOwner({ kind: "approval", taskId: task.id, taskTitle: task.title, detail: `${input.action} requires approval before the cloud adapter can run it.` });

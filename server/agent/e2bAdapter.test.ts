@@ -422,15 +422,15 @@ describe("E2BCloudSandboxAdapter browser.interact", () => {
     expect(state.storagePutCalls).toHaveLength(0);
   });
 
-  it("requires approval by policy (approvalSensitive), unlike browser.navigate", async () => {
+  it("requires approval by policy (riskTier above low), unlike browser.navigate", async () => {
     // Not exercised through the adapter (policy enforcement happens in
     // policy.ts/the router, upstream of the adapter) -- this just pins
     // down the registry fact the rest of this capability's safety
     // argument depends on, so a future change to registry.ts that
-    // silently drops this flag gets caught here too.
+    // silently drops this tier gets caught here too.
     const { capabilityRegistry } = await import("./registry");
     const entry = capabilityRegistry.find(c => c.name === "browser.interact");
-    expect(entry?.approvalSensitive).toBe(true);
+    expect(entry?.riskTier).not.toBe("low");
   });
 });
 

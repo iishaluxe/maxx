@@ -9,7 +9,7 @@ import {
 } from "../db";
 import { alertOwner } from "./ownerAlerts";
 import { CapabilityBroker, formatEvidenceItem, type CapabilityRequest } from "./execution";
-import { assessBudget } from "./policy";
+import { assessBudget, classifyRisk } from "./policy";
 import {
   decideRecovery,
   interpretObservation,
@@ -140,7 +140,7 @@ export async function runAgentTask(
           taskId: task.id,
           action: step.title,
           rationale: dispatch.reason,
-          risk: step.risk === "high" ? "high" : "medium",
+          risk: classifyRisk({ capability: step.capability as CapabilityRequest["capability"], target: request.target, destructive: request.destructive }) as "medium" | "high" | "critical",
           context: { capability: step.capability, stepId: step.id },
         });
         await updateTaskStatus({ taskId: task.id, ownerId, status: "waiting_approval", currentPhase: "Waiting for an execution approval" });

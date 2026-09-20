@@ -91,7 +91,7 @@ function enrichGoal(input: PlannerGatewayInput) {
     name: capability.name,
     label: capability.label,
     description: capability.description,
-    approvalSensitive: capability.approvalSensitive,
+    riskTier: capability.riskTier,
   }));
 
   return [

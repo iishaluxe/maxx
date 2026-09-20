@@ -1,4 +1,5 @@
 import type { CapabilityBroker } from "../execution";
+import { classifyRisk } from "../policy";
 import {
   createTaskApproval,
   getAgentTaskDetail,
@@ -108,7 +109,13 @@ export async function runDurableTask(
       taskId: task.id,
       action: pending?.title ?? "Pending capability",
       rationale: result.reason ?? "Execution paused for approval.",
-      risk: pending?.risk === "high" ? "high" : "medium",
+      risk: pending
+        ? (classifyRisk({
+            capability: pending.capability as Parameters<typeof classifyRisk>[0]["capability"],
+            target: task.executionTarget,
+            destructive: pending.risk === "high",
+          }) as "medium" | "high" | "critical")
+        : "medium",
       context: pending ? { capability: pending.capability, stepId: pending.id } : {},
     });
     await updateTaskStatus({ taskId: task.id, ownerId, status: "waiting_approval", currentPhase: "Waiting for an execution approval" });
