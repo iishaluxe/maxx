@@ -288,6 +288,39 @@ export const agentRouter = router({
     return { success: true, alreadyTerminal: false };
   }),
 
+  // Reuses "waiting_approval" rather than adding a new task-status enum
+  // value (which would need a schema migration) -- the same status
+  // already means "not actively running," and this and the genuine
+  // approval-pending case are distinguished structurally by whether a
+  // pending agentApprovals row exists for the task, not by a separate
+  // status. See AEGIS_PROJECT_MAP's Step 7 section for why this was
+  // chosen over a migration.
+  pause: protectedProcedure.input(z.object({ taskId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+    const task = await getAgentTask(input.taskId, ctx.user.id);
+    if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "Task was not found." });
+    if (!["planning", "queued", "executing", "verifying", "recovering"].includes(task.status)) {
+      throw new TRPCError({ code: "CONFLICT", message: "Only an actively running task can be paused." });
+    }
+    await updateTaskStatus({ taskId: task.id, ownerId: ctx.user.id, status: "waiting_approval", currentPhase: "Paused by owner for inspection." });
+    await appendExecutionEvent({ taskId: task.id, kind: "task.paused", level: "info", title: "Paused by owner", content: "Execution paused for manual inspection; no approval decision is pending." });
+    return { success: true };
+  }),
+
+  resume: protectedProcedure.input(z.object({ taskId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+    const task = await getAgentTask(input.taskId, ctx.user.id);
+    if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "Task was not found." });
+    if (task.status !== "waiting_approval") {
+      throw new TRPCError({ code: "CONFLICT", message: "Only a paused task can be resumed this way." });
+    }
+    const pending = await listPendingApprovals(ctx.user.id);
+    if (pending.some(approval => approval.taskId === task.id)) {
+      throw new TRPCError({ code: "CONFLICT", message: "This task has a pending approval decision -- decide the approval instead of resuming directly." });
+    }
+    await updateTaskStatus({ taskId: task.id, ownerId: ctx.user.id, status: "queued", currentPhase: "Resumed by owner." });
+    await appendExecutionEvent({ taskId: task.id, kind: "task.resumed", level: "info", title: "Resumed by owner", content: "Execution resumed after a manual pause." });
+    return { success: true };
+  }),
+
   killAll: protectedProcedure.mutation(async ({ ctx }) => {
     const tasks = await listAgentTasks(ctx.user.id);
     const active = tasks.filter(task => ["planning", "queued", "executing", "waiting_approval", "verifying", "recovering"].includes(task.status));
