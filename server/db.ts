@@ -157,6 +157,32 @@ export async function updateTaskStatus(input: {
     .where(and(eq(agentTasks.id, input.taskId), eq(agentTasks.ownerId, input.ownerId)));
 }
 
+// Atomically claims a task for execution: the status-eligibility check and
+// the write happen in one guarded UPDATE, so two concurrent callers (a
+// double-click, two open tabs, a client retry racing the original call)
+// can't both read "queued" and both proceed. Only the caller whose UPDATE
+// actually matched a row -- affectedRows > 0 -- won the claim; the other
+// sees 0 rows affected and must not start execution. This replaces the
+// read-then-branch status checks that used to sit in runTask's router
+// mutation and at the top of runDurableTask, neither of which closed the
+// race since a status read and a later write are never atomic together.
+export async function claimTaskForExecution(input: {
+  taskId: string;
+  ownerId: number;
+  eligibleStatuses: AgentTask["status"][];
+}): Promise<boolean> {
+  const db = await requireDb();
+  const [result] = await db
+    .update(agentTasks)
+    .set({ status: "executing", currentPhase: "Claimed for execution", startedAt: new Date() })
+    .where(and(
+      eq(agentTasks.id, input.taskId),
+      eq(agentTasks.ownerId, input.ownerId),
+      inArray(agentTasks.status, input.eligibleStatuses),
+    ));
+  return result.affectedRows > 0;
+}
+
 export async function replaceAgentPlan(taskId: string, steps: Omit<AgentPlanStep, "id" | "taskId" | "createdAt" | "updatedAt">[]) {
   const db = await requireDb();
   await db.delete(agentPlanSteps).where(eq(agentPlanSteps.taskId, taskId));
