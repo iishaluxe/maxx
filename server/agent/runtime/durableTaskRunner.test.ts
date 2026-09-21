@@ -50,6 +50,11 @@ vi.mock("../../db", () => ({
   updateTaskStatus: vi.fn(async (input: { status: string }) => {
     dbState.taskStatus = input.status;
   }),
+  claimTaskForExecution: vi.fn(async (input: { eligibleStatuses: string[] }) => {
+    if (!input.eligibleStatuses.includes(dbState.taskStatus)) return false;
+    dbState.taskStatus = "executing";
+    return true;
+  }),
   updateTaskUsage: vi.fn(async () => undefined),
   createTaskApproval: vi.fn(async (input: { taskId: string; action: string; risk: string }) => {
     dbState.approvals.push(input);
@@ -131,5 +136,19 @@ describe("runDurableTask", () => {
     dbState.taskStatus = "completed";
     const result = await runDurableTask("task-1", 1, brokerReturning("observation"));
     expect(result.outcome).toBe("no_op");
+  });
+
+  it("rejects a concurrent run instead of racing a task that's already executing", async () => {
+    // This is the actual Step 9 fix: a task already mid-execution (e.g.
+    // a second browser tab, or a client retry racing the first call)
+    // must not start a second real run. dispatch is a vi.fn(), so
+    // asserting it was never called proves this returns before doing
+    // any real work, not just that the outcome field happens to be
+    // no_op.
+    dbState.taskStatus = "executing";
+    const broker = brokerReturning("observation");
+    const result = await runDurableTask("task-1", 1, broker);
+    expect(result.outcome).toBe("no_op");
+    expect(broker.dispatch).not.toHaveBeenCalled();
   });
 });

@@ -1,6 +1,7 @@
 import type { CapabilityBroker } from "../execution";
 import { classifyRisk } from "../policy";
 import {
+  claimTaskForExecution,
   createTaskApproval,
   getAgentTaskDetail,
   updatePlanStepStatus,
@@ -45,14 +46,21 @@ export async function runDurableTask(
   if (!detail) return { outcome: "no_op", cycles: 0, message: "Task was not found." };
 
   const { task } = detail;
-  if (!["queued", "executing", "recovering"].includes(task.status)) {
-    return { outcome: "no_op", cycles: 0, message: `Task is in status "${task.status}" and is not eligible to run.` };
-  }
   if (task.cancellationRequested) {
     return { outcome: "no_op", cycles: 0, message: "Task was cancelled before it could run." };
   }
   if (task.executionTarget !== "cloud_sandbox" && task.executionTarget !== "auto") {
     return { outcome: "no_op", cycles: 0, message: "The selected execution target is not yet connected to a production adapter." };
+  }
+  const claimed = await claimTaskForExecution({ taskId, ownerId, eligibleStatuses: ["queued", "recovering"] });
+  if (!claimed) {
+    return {
+      outcome: "no_op",
+      cycles: 0,
+      message: task.status === "executing"
+        ? "Task is already executing (possibly in another session) or is stuck from a crashed run -- pause and resume it to reclaim, rather than running it again directly."
+        : `Task is in status "${task.status}" and is not eligible to run.`,
+    };
   }
 
   const runtime = new DurableAgentRuntime(
@@ -61,14 +69,15 @@ export async function runDurableTask(
   );
   const resumed = await runtime.restoreLatestCheckpoint();
 
-  // The router only allows this call when agentTasks.status is queued,
-  // executing, or recovering — which is exactly the DB-level signal that
-  // an approval was granted (or this is a fresh/retried run). The
-  // runtime's own persisted checkpoint has no way to know that on its
-  // own: it only sees its last checkpointed status, which for a
-  // previously-paused task is still "waiting". Without this bridge,
-  // AgentLoop.run() would see "waiting" and return immediately every
-  // time, and an approved task would never actually resume.
+  // claimTaskForExecution above already moved agentTasks.status to
+  // "executing" atomically -- that's the DB-level signal that an
+  // approval was granted (or this is a fresh/retried run) and this
+  // caller specifically won the race to run it. The runtime's own
+  // persisted checkpoint has no way to know that on its own: it only
+  // sees its last checkpointed status, which for a previously-paused
+  // task is still "waiting". Without this bridge, AgentLoop.run() would
+  // see "waiting" and return immediately every time, and an approved
+  // task would never actually resume.
   if (resumed && runtime.getState().status === "waiting") {
     runtime.resume();
     await runtime.persistLatestEvent();

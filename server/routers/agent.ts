@@ -137,7 +137,12 @@ export const agentRouter = router({
   runTask: protectedProcedure.input(z.object({ taskId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
     const task = await getAgentTask(input.taskId, ctx.user.id);
     if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "Task was not found." });
-    if (!["queued", "executing", "recovering"].includes(task.status)) {
+    // Advisory fast-fail only, so a client gets a quick, clear error
+    // without waiting for the full call -- this check and the actual
+    // write are not atomic together, so it cannot by itself prevent two
+    // concurrent calls from both passing it. runDurableTask's
+    // claimTaskForExecution is the real, atomic guard against that race.
+    if (!["queued", "recovering"].includes(task.status)) {
       throw new TRPCError({ code: "CONFLICT", message: `Task cannot be run from status "${task.status}".` });
     }
     return runDurableTask(task.id, ctx.user.id, capabilityBroker);
