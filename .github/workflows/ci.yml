@@ -1,0 +1,51 @@
+name: CI
+
+# Nothing in this repo has ever run these checks automatically before
+# this workflow -- every prior merge to main was only verified manually,
+# by whoever (or whatever) prepared that delivery, in their own local
+# environment. This is the first automatic, repeatable check that runs
+# the same way for every push and PR from here on.
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pins to the exact pnpm version already declared in package.json's
+      # "packageManager" field, rather than a separately-chosen version
+      # that could silently drift from what `pnpm install` actually uses
+      # locally.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.4.1
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check
+        run: pnpm check
+
+      - name: Test
+        run: pnpm test -- --maxWorkers=1 --minWorkers=1
+        env:
+          # Required for server/agent/e2bCredential.test.ts, which
+          # authenticates against the real E2B sandbox-listing endpoint.
+          # Without this secret configured in the repository settings,
+          # that one test fails -- deliberately, not silently skipped --
+          # since it's checking a real production credential dependency,
+          # not exercising a mock. Add it under
+          # Settings > Secrets and variables > Actions > New repository
+          # secret, named E2B_API_KEY, to get a fully green run.
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
